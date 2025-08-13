@@ -1,0 +1,82 @@
+{
+  "project_info": {
+    "project_number": "1014078666263",
+    "project_id": "delf-chat-global",
+    "storage_bucket": "delf-chat-global.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1014078666263:android:be2b018c0b94db0a00ce52",
+        "android_client_info": {
+          "package_name": "com.example.delf_app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1014078666263-bes52lch17hol2bdd44416l03m0abinu.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDUfiqTZkcc5ZhFBPCPQu3SczYDJFn8Bo8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1014078666263-bes52lch17hol2bdd44416l03m0abinu.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "1014078666263-7gpm88inedbbd9ger64heo9q126q3tre.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.delfGlobal"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1014078666263:android:779d3db3dbdf5f8800ce52",
+        "android_client_info": {
+          "package_name": "com.example.delf_global"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1014078666263-bes52lch17hol2bdd44416l03m0abinu.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDUfiqTZkcc5ZhFBPCPQu3SczYDJFn8Bo8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1014078666263-bes52lch17hol2bdd44416l03m0abinu.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "1014078666263-7gpm88inedbbd9ger64heo9q126q3tre.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.delfGlobal"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
