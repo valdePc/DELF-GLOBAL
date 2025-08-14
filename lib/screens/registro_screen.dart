@@ -5,13 +5,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl_phone_field/intl_phone_field.dart';
 import 'package:uuid/uuid.dart';
+
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter_gen/gen_l10n/app_localizations.dart';
 
-import 'airtable_service.dart';
 import 'sms_verification.dart';
 import 'principal.dart';
+
 
 class RegistroScreen extends StatefulWidget {
   const RegistroScreen({super.key});
@@ -54,57 +56,52 @@ class RegistroScreenState extends State<RegistroScreen> {
     setState(() => birthdate = picked);
   }
 
+/// Verifica si ya hay un perfil con ese teléfono en Firestore.
+  /// (Ojo: desde cliente no podemos consultar usuarios de Auth;
+  /// esto es una verificación "best-effort" sobre tu colección `users`.)
+  /// 
+  
   Future<void> checkPhoneRegistration(String value) async {
-    // Evita llamadas repetidas mientras el usuario escribe
-    final exists = await AirtableService.isPhoneRegistered(value);
-    if (!mounted) return;
-    setState(() => phoneAlreadyRegistered = exists);
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('users')
+          .where('phone', isEqualTo: value)
+          .limit(1)
+          .get();
+      if (!mounted) return;
+      setState(() => phoneAlreadyRegistered = snap.docs.isNotEmpty);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => phoneAlreadyRegistered = false);
+    }
   }
 
   // Envío de código:
   // - Web: simulado (navega y usas 123456)
   // - Móvil: SMS real con verifyPhoneNumber
+
+  /// Envía SMS de verificación en **todas** las plataformas (Web incl.).
   Future<void> sendSmsCode() async {
     final fx = _uuid.v4();
     final l = AppLocalizations.of(context)!;
 
-    if (kIsWeb) {
-      // Simulado para Web (sin reCAPTCHA ni SMS real)
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(l.registerVerificationSent)),
-      );
-      if (!mounted) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => SmsVerificationScreen(
-            fullName: fullName,
-            phone: phone,
-            birthdate: birthdate,
-            password: password,
-            fx: fx,
-            verificationId: _uuid.v4(), // solo para seguir tu firma actual
-          ),
-        ),
-      );
-      return;
-    }
-
-    // Android/iOS: SMS real
     await FirebaseAuth.instance.verifyPhoneNumber(
       phoneNumber: phone,
       timeout: const Duration(seconds: 60),
       verificationCompleted: (PhoneAuthCredential credential) {
-        // Podemos auto-completar si llega el SMS en Android; por ahora no lo usamos.
+        // En Android puede autocompletar; aquí no lo usamos para mantener el mismo flujo visual.
       },
       verificationFailed: (FirebaseAuthException e) {
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al enviar código: ${e.message}')),
+          SnackBar(content: Text('Error al enviar código: ${e.message ?? e.code}')),
         );
       },
       codeSent: (String verificationId, int? resendToken) {
         if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(l.registerVerificationSent)),
+        );
         Navigator.push(
           context,
           MaterialPageRoute(
@@ -112,6 +109,7 @@ class RegistroScreenState extends State<RegistroScreen> {
               fullName: fullName,
               phone: phone,
               birthdate: birthdate,
+              // NO usamos password en servidor; solo validamos que coincidan.
               password: password,
               fx: fx,
               verificationId: verificationId,
@@ -123,10 +121,9 @@ class RegistroScreenState extends State<RegistroScreen> {
     );
   }
 
-  Future<void> _register() async {
-    final l = AppLocalizations.of(context)!;
 
-    // Cierra el teclado
+ Future<void> _register() async {
+    final l = AppLocalizations.of(context)!;
     FocusScope.of(context).unfocus();
 
     if (!_formKey.currentState!.validate()) return;
@@ -139,6 +136,7 @@ class RegistroScreenState extends State<RegistroScreen> {
       return;
     }
 
+   // Si ya existe en tu colección de perfiles, avisa (opcional)
     if (phoneAlreadyRegistered) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(l.registerPhoneAlreadyUsed)),
@@ -159,15 +157,10 @@ class RegistroScreenState extends State<RegistroScreen> {
       final auth = FirebaseAuth.instance;
       final googleProvider = GoogleAuthProvider();
 
+      User? user;
       if (kIsWeb) {
-        final userCredential = await auth.signInWithPopup(googleProvider);
-        final user = userCredential.user;
-        if (user != null && mounted) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (_) => const PrincipalScreen()),
-          );
-        }
+        final cred = await auth.signInWithPopup(googleProvider);
+        user = cred.user;
       } else {
         final googleUser = await GoogleSignIn().signIn();
         if (googleUser == null) return;
@@ -176,14 +169,31 @@ class RegistroScreenState extends State<RegistroScreen> {
           accessToken: googleAuth.accessToken,
           idToken: googleAuth.idToken,
         );
-        final userCredential = await auth.signInWithCredential(credential);
-        final user = userCredential.user;
-        if (user != null && mounted) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (_) => const PrincipalScreen()),
-          );
-        }
+        final cred = await auth.signInWithCredential(credential);
+        user = cred.user;
+      }
+
+      if (user != null) {
+        // Crea/actualiza perfil en Firestore
+        final ref = FirebaseFirestore.instance.collection('users').doc(user.uid);
+        await ref.set(
+          {
+            'uid': user.uid,
+            'fullName': user.displayName ?? fullName,
+            'phone': user.phoneNumber ?? phone,
+            'birthdate': birthdate != null ? Timestamp.fromDate(birthdate!) : null,
+            'provider': 'google',
+            'updatedAt': FieldValue.serverTimestamp(),
+            'createdAt': FieldValue.serverTimestamp(),
+          },
+          SetOptions(merge: true),
+        );
+
+        if (!mounted) return;
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const PrincipalScreen()),
+        );
       }
     } catch (e) {
       if (!mounted) return;
@@ -213,10 +223,7 @@ class RegistroScreenState extends State<RegistroScreen> {
       appBar: AppBar(
         backgroundColor: Colors.transparent,
         elevation: 0,
-        title: Text(
-          l.registerTitle,
-          style: const TextStyle(color: Colors.black87),
-        ),
+        title: Text(l.registerTitle, style: const TextStyle(color: Colors.black87)),
         centerTitle: true,
       ),
       body: Container(
@@ -239,11 +246,7 @@ class RegistroScreenState extends State<RegistroScreen> {
                 children: [
                   // Logo
                   Center(
-                    child: Image.asset(
-                      'assets/delf_logo.png',
-                      height: 100,
-                      fit: BoxFit.contain,
-                    ),
+                    child: Image.asset('assets/delf_logo.png', height: 100, fit: BoxFit.contain),
                   ),
                   const SizedBox(height: 24),
 
@@ -271,14 +274,12 @@ class RegistroScreenState extends State<RegistroScreen> {
                       phone = pn.completeNumber;
                       _debounce?.cancel();
                       _debounce = Timer(const Duration(milliseconds: 500), () {
-                        if (phone.isNotEmpty) {
-                          checkPhoneRegistration(phone);
-                        }
+                        if (phone.isNotEmpty) checkPhoneRegistration(phone);
                       });
                     },
                     validator: (value) {
                       if (value == null || value.number.isEmpty) return l.registerEnterPhone;
-                      if ((value.number).length < 6) return 'Teléfono inválido';
+                      if (value.number.length < 6) return 'Teléfono inválido';
                       return null;
                     },
                   ),
@@ -308,7 +309,7 @@ class RegistroScreenState extends State<RegistroScreen> {
                   ),
                   const SizedBox(height: 16),
 
-                  // Contraseña
+                  // Contraseña (solo validación local)
                   TextFormField(
                     decoration: _inputDecoration(
                       l.registerPassword,
@@ -331,7 +332,7 @@ class RegistroScreenState extends State<RegistroScreen> {
                   ),
                   const SizedBox(height: 16),
 
-                  // Confirmación de contraseña
+                  // Confirmación de contraseña (solo validación local)
                   TextFormField(
                     decoration: _inputDecoration(
                       l.registerConfirmPassword,
@@ -340,8 +341,8 @@ class RegistroScreenState extends State<RegistroScreen> {
                           _isConfirmPasswordVisible ? Icons.visibility_off : Icons.visibility,
                           color: Colors.black54,
                         ),
-                        onPressed: () =>
-                            setState(() => _isConfirmPasswordVisible = !_isConfirmPasswordVisible),
+                        onPressed: () => setState(
+                            () => _isConfirmPasswordVisible = !_isConfirmPasswordVisible),
                       ),
                     ),
                     obscureText: !_isConfirmPasswordVisible,
@@ -360,10 +361,7 @@ class RegistroScreenState extends State<RegistroScreen> {
                     duration: const Duration(milliseconds: 400),
                     child: isRegistering
                         ? const Center(
-                            child: CircularProgressIndicator(
-                              color: Colors.white,
-                              strokeWidth: 2,
-                            ),
+                            child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
                           )
                         : ElevatedButton.icon(
                             key: const ValueKey('registerButton'),
@@ -376,7 +374,8 @@ class RegistroScreenState extends State<RegistroScreen> {
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(20),
                               ),
-                              padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 15),
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 40, vertical: 15),
                             ),
                           ),
                   ),
@@ -418,9 +417,7 @@ class RegistroScreenState extends State<RegistroScreen> {
       labelStyle: const TextStyle(color: Colors.white70),
       filled: true,
       fillColor: Colors.white.withOpacity(0.1),
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-      ),
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
       suffixIcon: icon,
     );
   }
