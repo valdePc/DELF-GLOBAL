@@ -1,4 +1,4 @@
-// lib/screens/sms_verification.dart
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -9,9 +9,9 @@ class SmsVerificationScreen extends StatefulWidget {
   final String fullName;
   final String phone;
   final DateTime? birthdate;
-  final String password;        // solo validaste localmente; no se sube
-  final String fx;              // id de registro opcional
-  final String verificationId;  // viene de verifyPhoneNumber()
+  final String password;        // validación local únicamente
+  final String fx;              // id opcional de registro
+  final String verificationId;  // de verifyPhoneNumber()
 
   const SmsVerificationScreen({
     super.key,
@@ -38,6 +38,25 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
     super.dispose();
   }
 
+  Future<void> _saveProfile(User user) async {
+    final usersRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
+    await usersRef.set(
+      {
+        'uid': user.uid,
+        'fullName': widget.fullName,
+        'phone': widget.phone,
+        'birthdate': widget.birthdate != null
+            ? Timestamp.fromDate(widget.birthdate!)
+            : null,
+        'provider': 'phone',
+        'fx': widget.fx,
+        'updatedAt': FieldValue.serverTimestamp(),
+        'createdAt': FieldValue.serverTimestamp(),
+      },
+      SetOptions(merge: true),
+    );
+  }
+
   Future<void> _verify() async {
     FocusScope.of(context).unfocus();
     setState(() {
@@ -47,57 +66,52 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
 
     try {
       final smsCode = _codeCtrl.text.trim();
-      if (smsCode.isEmpty || smsCode.length < 6) {
+      if (smsCode.length < 6) {
         throw FirebaseAuthException(code: 'invalid-code', message: 'Código inválido');
       }
 
-      // 1) Verificar OTP
+      // 1) Construir credencial y firmar con timeout
       final cred = PhoneAuthProvider.credential(
         verificationId: widget.verificationId,
         smsCode: smsCode,
       );
-      final userCred = await FirebaseAuth.instance.signInWithCredential(cred);
+
+      final userCred = await FirebaseAuth.instance
+          .signInWithCredential(cred)
+          .timeout(const Duration(seconds: 20));
+
       final user = userCred.user;
       if (user == null) {
-        throw FirebaseAuthException(code: 'no-user', message: 'Usuario no disponible');
+        throw FirebaseAuthException(code: 'no-user', message: 'No se pudo obtener el usuario');
       }
 
-      // 2) Guardar/actualizar perfil en Firestore
-      final usersRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
-      await usersRef.set(
-        {
-          'uid': user.uid,
-          'fullName': widget.fullName,
-          'phone': widget.phone,
-          'birthdate': widget.birthdate != null
-              ? Timestamp.fromDate(widget.birthdate!)
-              : null,
-          'provider': 'phone',
-          'fx': widget.fx,
-          'updatedAt': FieldValue.serverTimestamp(),
-          'createdAt': FieldValue.serverTimestamp(),
-        },
-        SetOptions(merge: true),
-      );
-
+      // 2) Ir a la app de inmediato
       if (!mounted) return;
       Navigator.pushAndRemoveUntil(
         context,
         MaterialPageRoute(builder: (_) => const PrincipalScreen()),
         (_) => false,
       );
+
+      // 3) Guardar perfil en segundo plano (no bloquea la navegación)
+      //    Si falla, mostramos un aviso pero no interrumpimos la sesión.
+      unawaited(
+        _saveProfile(user).catchError((e) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Perfil no guardado: $e')),
+            );
+          }
+        }),
+      );
+    } on TimeoutException {
+      setState(() => _error = 'Tiempo de espera agotado. Verifica tu conexión e intenta de nuevo.');
     } on FirebaseAuthException catch (e) {
-      setState(() {
-        _error = '${e.code}: ${e.message ?? ''}';
-      });
+      setState(() => _error = '${e.code}: ${e.message ?? ''}');
     } catch (e) {
-      setState(() {
-        _error = e.toString();
-      });
+      setState(() => _error = e.toString());
     } finally {
-      if (mounted) {
-        setState(() => _isVerifying = false);
-      }
+      if (mounted) setState(() => _isVerifying = false);
     }
   }
 
@@ -123,11 +137,7 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
             ),
             const SizedBox(height: 12),
             if (_error != null)
-              Text(
-                _error!,
-                style: const TextStyle(color: Colors.red),
-                textAlign: TextAlign.center,
-              ),
+              Text(_error!, style: const TextStyle(color: Colors.red), textAlign: TextAlign.center),
             const SizedBox(height: 12),
             ElevatedButton(
               onPressed: _isVerifying ? null : _verify,
