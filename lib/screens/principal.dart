@@ -12,7 +12,8 @@ import 'telefono.dart';
 import 'grupos.dart';
 import 'configuracion_screen.dart';
 import 'add_contact.dart';
-
+import 'package:shared_preferences/shared_preferences.dart';
+import 'registro_screen.dart';
 
 
 /// Modelo simple para un contacto real

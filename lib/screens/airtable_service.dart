@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'package:delf_global/screens/constants.dart';
+import 'constants.dart';  // en vez de package:delf_global/screens/constants.dart
 
 
 class AirtableService {
