@@ -1,3 +1,4 @@
+// lib/screens/registro_screen.dart
 import 'dart:async';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
@@ -21,16 +22,18 @@ class RegistroScreen extends StatefulWidget {
 
 class RegistroScreenState extends State<RegistroScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _uuid = Uuid();    // ← perfecto
+  final _uuid = const Uuid();
+
   String fullName = '';
   String phone = '';
   DateTime? birthdate;
   String password = '';
   String confirmPassword = '';
+
   bool isRegistering = false;
   bool phoneAlreadyRegistered = false;
-  Timer? _debounce;
 
+  Timer? _debounce;
   bool _isPasswordVisible = false;
   bool _isConfirmPasswordVisible = false;
 
@@ -40,22 +43,68 @@ class RegistroScreenState extends State<RegistroScreen> {
     super.dispose();
   }
 
- Future<void> sendSmsCode() async {
-    // 1) Genera un identificador único antes de iniciar la verificación
-    final fx = _uuid.v4();
+  Future<void> _selectBirthdate() async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: DateTime(2000, 1, 1),
+      firstDate: DateTime(1900),
+      lastDate: DateTime.now(),
+    );
+    if (!mounted) return;
+    setState(() => birthdate = picked);
+  }
 
-    // 2) Envía el SMS con Firebase
+  Future<void> checkPhoneRegistration(String value) async {
+    // Evita llamadas repetidas mientras el usuario escribe
+    final exists = await AirtableService.isPhoneRegistered(value);
+    if (!mounted) return;
+    setState(() => phoneAlreadyRegistered = exists);
+  }
+
+  // Envío de código:
+  // - Web: simulado (navega y usas 123456)
+  // - Móvil: SMS real con verifyPhoneNumber
+  Future<void> sendSmsCode() async {
+    final fx = _uuid.v4();
+    final l = AppLocalizations.of(context)!;
+
+    if (kIsWeb) {
+      // Simulado para Web (sin reCAPTCHA ni SMS real)
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(l.registerVerificationSent)),
+      );
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => SmsVerificationScreen(
+            fullName: fullName,
+            phone: phone,
+            birthdate: birthdate,
+            password: password,
+            fx: fx,
+            verificationId: _uuid.v4(), // solo para seguir tu firma actual
+          ),
+        ),
+      );
+      return;
+    }
+
+    // Android/iOS: SMS real
     await FirebaseAuth.instance.verifyPhoneNumber(
       phoneNumber: phone,
       timeout: const Duration(seconds: 60),
-      verificationCompleted: (_) {},
+      verificationCompleted: (PhoneAuthCredential credential) {
+        // Podemos auto-completar si llega el SMS en Android; por ahora no lo usamos.
+      },
       verificationFailed: (FirebaseAuthException e) {
+        if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error al enviar código: ${e.message}')),
         );
       },
       codeSent: (String verificationId, int? resendToken) {
-        // 3) Navega al SMSVerificationScreen, pasándole también el fx
+        if (!mounted) return;
         Navigator.push(
           context,
           MaterialPageRoute(
@@ -64,7 +113,7 @@ class RegistroScreenState extends State<RegistroScreen> {
               phone: phone,
               birthdate: birthdate,
               password: password,
-              fx: fx,                     // ← el UUID aquí
+              fx: fx,
               verificationId: verificationId,
             ),
           ),
@@ -74,104 +123,85 @@ class RegistroScreenState extends State<RegistroScreen> {
     );
   }
 
-  Future<void> checkPhoneRegistration(String phone) async {
-    bool exists = await AirtableService.isPhoneRegistered(phone);
-    setState(() {
-      phoneAlreadyRegistered = exists;
-    });
-  }
-
-  Future<void> _selectBirthdate() async {
-    DateTime? picked = await showDatePicker(
-      context: context,
-      initialDate: DateTime(2000, 1, 1),
-      firstDate: DateTime(1900),
-      lastDate: DateTime.now(),
-    );
-    setState(() {
-      birthdate = picked;
-    });
-    }
-
   Future<void> _register() async {
-    final localizations = AppLocalizations.of(context)!;
+    final l = AppLocalizations.of(context)!;
 
-    if (_formKey.currentState!.validate()) {
-      _formKey.currentState!.save();
+    // Cierra el teclado
+    FocusScope.of(context).unfocus();
 
-      if (password != confirmPassword) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(localizations.registerPasswordsDontMatch)),
-        );
-        return;
-      }
+    if (!_formKey.currentState!.validate()) return;
+    _formKey.currentState!.save();
 
-      if (phoneAlreadyRegistered) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(localizations.registerPhoneAlreadyUsed)),
-        );
-        return;
-      }
-
-      setState(() => isRegistering = true);
-      await sendSmsCode();
-      setState(() => isRegistering = false);
-    }
-  }
-
-
-Future<void> signInWithGoogle() async {
-  try {
-    final auth = FirebaseAuth.instance;
-    final googleProvider = GoogleAuthProvider();
-
-    if (kIsWeb) {
-      // 👉 En Web usamos signInWithPopup (o signInWithRedirect)
-      final userCredential = await auth.signInWithPopup(googleProvider);
-      final user = userCredential.user;
-
-      if (user != null && mounted) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const PrincipalScreen()),
-        );
-      }
-    } else {
-      // 👉 En Móvil usamos GoogleSignIn
-      final googleUser = await GoogleSignIn().signIn();
-      if (googleUser == null) return;
-
-      final googleAuth = await googleUser.authentication;
-      final credential = GoogleAuthProvider.credential(
-        accessToken: googleAuth.accessToken,
-        idToken: googleAuth.idToken,
+    if (password != confirmPassword) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(l.registerPasswordsDontMatch)),
       );
-
-      final userCredential = await auth.signInWithCredential(credential);
-      final user = userCredential.user;
-
-      if (user != null && mounted) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const PrincipalScreen()),
-        );
-      }
+      return;
     }
-  } catch (e) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('❌ Error al iniciar sesión con Google: $e')),
-    );
+
+    if (phoneAlreadyRegistered) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(l.registerPhoneAlreadyUsed)),
+      );
+      return;
+    }
+
+    setState(() => isRegistering = true);
+    try {
+      await sendSmsCode();
+    } finally {
+      if (mounted) setState(() => isRegistering = false);
+    }
   }
-}
 
+  Future<void> signInWithGoogle() async {
+    try {
+      final auth = FirebaseAuth.instance;
+      final googleProvider = GoogleAuthProvider();
 
+      if (kIsWeb) {
+        final userCredential = await auth.signInWithPopup(googleProvider);
+        final user = userCredential.user;
+        if (user != null && mounted) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (_) => const PrincipalScreen()),
+          );
+        }
+      } else {
+        final googleUser = await GoogleSignIn().signIn();
+        if (googleUser == null) return;
+        final googleAuth = await googleUser.authentication;
+        final credential = GoogleAuthProvider.credential(
+          accessToken: googleAuth.accessToken,
+          idToken: googleAuth.idToken,
+        );
+        final userCredential = await auth.signInWithCredential(credential);
+        final user = userCredential.user;
+        if (user != null && mounted) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (_) => const PrincipalScreen()),
+          );
+        }
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('❌ Error al iniciar sesión con Google: $e')),
+      );
+    }
+  }
+
+  String _formatDate(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
   @override
   Widget build(BuildContext context) {
-    final localizations = AppLocalizations.of(context)!;
+    final l = AppLocalizations.of(context)!;
 
     SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-      statusBarColor: Color.fromARGB(0, 201, 24, 24),
+      statusBarColor: Color.fromARGB(0, 0, 0, 0),
       systemNavigationBarColor: Color.fromARGB(0, 0, 0, 0),
       statusBarIconBrightness: Brightness.light,
       systemNavigationBarIconBrightness: Brightness.light,
@@ -183,7 +213,10 @@ Future<void> signInWithGoogle() async {
       appBar: AppBar(
         backgroundColor: Colors.transparent,
         elevation: 0,
-        title: Text(localizations.registerTitle, style: const TextStyle(color: Color.fromARGB(255, 12, 12, 12))),
+        title: Text(
+          l.registerTitle,
+          style: const TextStyle(color: Colors.black87),
+        ),
         centerTitle: true,
       ),
       body: Container(
@@ -191,7 +224,7 @@ Future<void> signInWithGoogle() async {
         height: double.infinity,
         decoration: const BoxDecoration(
           gradient: LinearGradient(
-            colors: [Color.fromARGB(255, 23, 3, 95), Color.fromARGB(252, 233, 36, 115)],
+            colors: [Color(0xFF17035F), Color(0xFFE92473)],
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),
@@ -201,155 +234,175 @@ Future<void> signInWithGoogle() async {
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 48),
             child: Form(
               key: _formKey,
-child: Column(
-  crossAxisAlignment: CrossAxisAlignment.stretch,
-  children: [
-    // 1) Logo centrado arriba
-    Center(
-      child: Image.asset(
-        'assets/delf_logo.png',  // asegúrate de tener este archivo en assets/
-        height: 100,
-        fit: BoxFit.contain,
-      ),
-    ),
-    const SizedBox(height: 24),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // Logo
+                  Center(
+                    child: Image.asset(
+                      'assets/delf_logo.png',
+                      height: 100,
+                      fit: BoxFit.contain,
+                    ),
+                  ),
+                  const SizedBox(height: 24),
 
-    // 2) Tu formulario empieza aquí
-    TextFormField(
-      decoration: _inputDecoration(localizations.registerFullName),
-      style: const TextStyle(color: Color.fromARGB(255, 7, 7, 7)),
-      onSaved: (val) => fullName = val!.trim(),
-      validator: (val) =>
-          val == null || val.isEmpty ? localizations.registerEnterName : null,
-    ),
-    const SizedBox(height: 16),
-    IntlPhoneField(
-      decoration: _inputDecoration(localizations.registerPhone),
-      initialCountryCode: 'US',
-      style: const TextStyle(color: Color.fromARGB(255, 2, 2, 2)),
-      dropdownTextStyle: const TextStyle(color: Colors.black),
-      onChanged: (phoneNumber) {
-        phone = phoneNumber.completeNumber;
-        _debounce?.cancel();
-        _debounce = Timer(const Duration(milliseconds: 500), () {
-          checkPhoneRegistration(phone);
-        });
-      },
-      validator: (value) =>
-                        value == null || value.number.isEmpty ? localizations.registerEnterPhone : null,
+                  // Nombre
+                  TextFormField(
+                    decoration: _inputDecoration(l.registerFullName),
+                    style: const TextStyle(color: Colors.black87),
+                    textInputAction: TextInputAction.next,
+                    onSaved: (v) => fullName = (v ?? '').trim(),
+                    validator: (v) {
+                      if (v == null || v.trim().isEmpty) return l.registerEnterName;
+                      if (v.trim().length < 3) return 'Mínimo 3 caracteres';
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 16),
+
+                  // Teléfono
+                  IntlPhoneField(
+                    decoration: _inputDecoration(l.registerPhone),
+                    initialCountryCode: 'US',
+                    style: const TextStyle(color: Colors.black87),
+                    dropdownTextStyle: const TextStyle(color: Colors.black87),
+                    onChanged: (pn) {
+                      phone = pn.completeNumber;
+                      _debounce?.cancel();
+                      _debounce = Timer(const Duration(milliseconds: 500), () {
+                        if (phone.isNotEmpty) {
+                          checkPhoneRegistration(phone);
+                        }
+                      });
+                    },
+                    validator: (value) {
+                      if (value == null || value.number.isEmpty) return l.registerEnterPhone;
+                      if ((value.number).length < 6) return 'Teléfono inválido';
+                      return null;
+                    },
                   ),
                   if (phoneAlreadyRegistered)
                     Padding(
-                      padding: const EdgeInsets.only(top: 8.0),
+                      padding: const EdgeInsets.only(top: 8),
                       child: Text(
-                        localizations.registerPhoneAlreadyUsed,
+                        l.registerPhoneAlreadyUsed,
                         style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
                       ),
                     ),
                   const SizedBox(height: 16),
+
+                  // Fecha de nacimiento
                   GestureDetector(
                     onTap: _selectBirthdate,
                     child: AbsorbPointer(
                       child: TextFormField(
                         decoration: _inputDecoration(
-                          birthdate == null
-                              ? localizations.registerBirthdate
-                              : '${birthdate!.year}-${birthdate!.month.toString().padLeft(2, '0')}-${birthdate!.day.toString().padLeft(2, '0')}',
-                          icon: const Icon(Icons.calendar_today, color: Color.fromARGB(255, 6, 6, 6)),
+                          birthdate == null ? l.registerBirthdate : _formatDate(birthdate!),
+                          icon: const Icon(Icons.calendar_today, color: Colors.black87),
                         ),
-                        style: const TextStyle(color: Color.fromARGB(255, 6, 6, 6)),
-                        validator: (_) => birthdate == null
-                            ? localizations.registerSelectBirthdate
-                            : null,
+                        style: const TextStyle(color: Colors.black87),
+                        validator: (_) => birthdate == null ? l.registerSelectBirthdate : null,
                       ),
                     ),
                   ),
                   const SizedBox(height: 16),
+
+                  // Contraseña
                   TextFormField(
                     decoration: _inputDecoration(
-                      localizations.registerPassword,
+                      l.registerPassword,
                       icon: IconButton(
                         icon: Icon(
                           _isPasswordVisible ? Icons.visibility_off : Icons.visibility,
-                          color: const Color.fromARGB(179, 3, 3, 3),
+                          color: Colors.black54,
                         ),
                         onPressed: () => setState(() => _isPasswordVisible = !_isPasswordVisible),
                       ),
                     ),
                     obscureText: !_isPasswordVisible,
-                    style: const TextStyle(color: Color.fromARGB(255, 5, 5, 5)),
-                    onSaved: (val) => password = val!,
-                    validator: (val) {
-                      if (val == null || val.isEmpty) return localizations.registerEnterPassword;
-                      if (val.length < 6) return localizations.registerPasswordTooShort;
+                    style: const TextStyle(color: Colors.black87),
+                    onSaved: (v) => password = v ?? '',
+                    validator: (v) {
+                      if (v == null || v.isEmpty) return l.registerEnterPassword;
+                      if (v.length < 6) return l.registerPasswordTooShort;
                       return null;
                     },
                   ),
                   const SizedBox(height: 16),
+
+                  // Confirmación de contraseña
                   TextFormField(
                     decoration: _inputDecoration(
-                      localizations.registerConfirmPassword,
+                      l.registerConfirmPassword,
                       icon: IconButton(
                         icon: Icon(
                           _isConfirmPasswordVisible ? Icons.visibility_off : Icons.visibility,
-                          color: const Color.fromARGB(179, 16, 12, 12),
+                          color: Colors.black54,
                         ),
-                        onPressed: () => setState(() => _isConfirmPasswordVisible = !_isConfirmPasswordVisible),
+                        onPressed: () =>
+                            setState(() => _isConfirmPasswordVisible = !_isConfirmPasswordVisible),
                       ),
                     ),
                     obscureText: !_isConfirmPasswordVisible,
-                    style: const TextStyle(color: Color.fromARGB(255, 17, 17, 17)),
-                    onSaved: (val) => confirmPassword = val!,
-                    validator: (val) =>
-                        val == null || val.isEmpty ? localizations.registerEnterConfirmation : null,
+                    style: const TextStyle(color: Colors.black87),
+                    onSaved: (v) => confirmPassword = v ?? '',
+                    validator: (v) {
+                      if (v == null || v.isEmpty) return l.registerEnterConfirmation;
+                      return null;
+                    },
                   ),
+
                   const SizedBox(height: 24),
-                 const SizedBox(height: 24),
-AnimatedSwitcher(
-  duration: const Duration(milliseconds: 400),
-  child: isRegistering
-      ? const CircularProgressIndicator(
-          color: Color.fromARGB(255, 255, 255, 255),
-          strokeWidth: 2,
-        )
-      : ElevatedButton.icon(
-          key: const ValueKey('registerButton'),
-          onPressed: _register,
-          icon: const Icon(Icons.rocket_launch),
-          label: Text(localizations.registerButton),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: const Color.fromARGB(255, 237, 235, 233),
-            foregroundColor: const Color.fromARGB(255, 4, 4, 4),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(20),
-            ),
-            padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 15),
-          ),
-        ),
-),
 
-const SizedBox(height: 24),
-const Divider(color: Colors.white30),
-const SizedBox(height: 8),
+                  // Botón Registrar
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 400),
+                    child: isRegistering
+                        ? const Center(
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
+                          )
+                        : ElevatedButton.icon(
+                            key: const ValueKey('registerButton'),
+                            onPressed: _register,
+                            icon: const Icon(Icons.rocket_launch),
+                            label: Text(l.registerButton),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFFEDEBE9),
+                              foregroundColor: Colors.black87,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 15),
+                            ),
+                          ),
+                  ),
 
-ElevatedButton.icon(
-  onPressed: () async {
-    setState(() => isRegistering = true);
-    await signInWithGoogle();
-    setState(() => isRegistering = false);
-  },
-  icon: Image.asset('assets/google.png', height: 24),
-  label: const Text("Continuar con Google"),
-  style: ElevatedButton.styleFrom(
-    backgroundColor: Colors.white,
-    foregroundColor: Colors.black87,
-    shape: RoundedRectangleBorder(
-      borderRadius: BorderRadius.circular(20),
-    ),
-    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-  ),
-),
+                  const SizedBox(height: 24),
+                  const Divider(color: Colors.white30),
+                  const SizedBox(height: 8),
 
+                  // Google
+                  ElevatedButton.icon(
+                    onPressed: () async {
+                      setState(() => isRegistering = true);
+                      await signInWithGoogle();
+                      if (mounted) setState(() => isRegistering = false);
+                    },
+                    icon: Image.asset('assets/google.png', height: 24),
+                    label: const Text("Continuar con Google"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      foregroundColor: Colors.black87,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                    ),
+                  ),
                 ],
               ),
             ),
