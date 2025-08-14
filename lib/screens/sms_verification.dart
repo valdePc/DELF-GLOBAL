@@ -1,153 +1,143 @@
-import 'dart:async';
+// lib/screens/sms_verification.dart
 import 'package:flutter/material.dart';
-import 'package:uuid/uuid.dart';
-import 'package:flutter_gen/gen_l10n/app_localizations.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 import 'principal.dart';
-import 'airtable_service.dart';
 
 class SmsVerificationScreen extends StatefulWidget {
   final String fullName;
   final String phone;
   final DateTime? birthdate;
-  final String password;
-  final String fx;
-  final String verificationId;
+  final String password;        // solo validaste localmente; no se sube
+  final String fx;              // id de registro opcional
+  final String verificationId;  // viene de verifyPhoneNumber()
 
   const SmsVerificationScreen({
-    Key? key,
+    super.key,
     required this.fullName,
     required this.phone,
     required this.birthdate,
     required this.password,
     required this.fx,
     required this.verificationId,
-  }) : super(key: key);
+  });
 
   @override
-  SmsVerificationScreenState createState() => SmsVerificationScreenState();
+  State<SmsVerificationScreen> createState() => _SmsVerificationScreenState();
 }
 
-class SmsVerificationScreenState extends State<SmsVerificationScreen> {
-  final _codeController = TextEditingController();
-  bool isVerifying = false;
-  String errorMessage = '';
-  int _secondsRemaining = 60;
-  Timer? _timer;
-  late String _currentVerificationId;
-
-  @override
-  void initState() {
-    super.initState();
-    _currentVerificationId = widget.verificationId;
-  }
+class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
+  final _codeCtrl = TextEditingController();
+  bool _isVerifying = false;
+  String? _error;
 
   @override
   void dispose() {
-    _timer?.cancel();
-    _codeController.dispose();
+    _codeCtrl.dispose();
     super.dispose();
   }
 
-  void startCountdown() {
-    setState(() => _secondsRemaining = 60);
-    _timer?.cancel();
-    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (_secondsRemaining == 0) {
-        timer.cancel();
-      } else {
-        setState(() => _secondsRemaining--);
-      }
-    });
-  }
-
-  Future<void> resendCode() async {
-    final l = AppLocalizations.of(context)!;
-    _currentVerificationId = const Uuid().v4();
-    startCountdown();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(l.verifyCodeResent)),
-    );
-  }
-
-  Future<void> verifyCode() async {
-    final l = AppLocalizations.of(context)!;
+  Future<void> _verify() async {
+    FocusScope.of(context).unfocus();
     setState(() {
-      isVerifying = true;
-      errorMessage = '';
+      _isVerifying = true;
+      _error = null;
     });
 
-    if (_codeController.text.trim() != '123456') {
-      setState(() {
-        errorMessage = l.verifyCodeInvalid;
-        isVerifying = false;
-      });
-      return;
-    }
+    try {
+      final smsCode = _codeCtrl.text.trim();
+      if (smsCode.isEmpty || smsCode.length < 6) {
+        throw FirebaseAuthException(code: 'invalid-code', message: 'Código inválido');
+      }
 
-    final birthdateStr = widget.birthdate != null
-        ? "${widget.birthdate!.year}-${widget.birthdate!.month.toString().padLeft(2, '0')}-${widget.birthdate!.day.toString().padLeft(2, '0')}"
-        : '';
+      // 1) Verificar OTP
+      final cred = PhoneAuthProvider.credential(
+        verificationId: widget.verificationId,
+        smsCode: smsCode,
+      );
+      final userCred = await FirebaseAuth.instance.signInWithCredential(cred);
+      final user = userCred.user;
+      if (user == null) {
+        throw FirebaseAuthException(code: 'no-user', message: 'Usuario no disponible');
+      }
 
-    final created = await AirtableService.createUser(
-      widget.fullName,
-      widget.phone,
-      birthdateStr,
-      widget.password,
-      widget.fx,
-    );
+      // 2) Guardar/actualizar perfil en Firestore
+      final usersRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
+      await usersRef.set(
+        {
+          'uid': user.uid,
+          'fullName': widget.fullName,
+          'phone': widget.phone,
+          'birthdate': widget.birthdate != null
+              ? Timestamp.fromDate(widget.birthdate!)
+              : null,
+          'provider': 'phone',
+          'fx': widget.fx,
+          'updatedAt': FieldValue.serverTimestamp(),
+          'createdAt': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
 
-    setState(() => isVerifying = false);
-
-    if (created) {
-      Navigator.pushReplacement(
+      if (!mounted) return;
+      Navigator.pushAndRemoveUntil(
         context,
         MaterialPageRoute(builder: (_) => const PrincipalScreen()),
+        (_) => false,
       );
-    } else {
-      setState(() => errorMessage = l.verifyUserCreationError);
+    } on FirebaseAuthException catch (e) {
+      setState(() {
+        _error = '${e.code}: ${e.message ?? ''}';
+      });
+    } catch (e) {
+      setState(() {
+        _error = e.toString();
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _isVerifying = false);
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final l = AppLocalizations.of(context)!;
+    final phoneShown = widget.phone;
 
     return Scaffold(
-      appBar: AppBar(
-        title: Text(l.verifySmsTitle),
-        centerTitle: true,
-      ),
+      appBar: AppBar(title: const Text('Verificación')),
       body: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            Text(l.verifySmsInstruction(widget.phone), style: const TextStyle(fontSize: 16)),
-            const SizedBox(height: 16),
+            Text('Ingresa el código SMS que recibiste en el número $phoneShown'),
+            const SizedBox(height: 12),
             TextField(
-              controller: _codeController,
+              controller: _codeCtrl,
               keyboardType: TextInputType.number,
-              decoration: InputDecoration(
-                labelText: l.verifyCodeLabel,
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              decoration: const InputDecoration(
+                labelText: 'Código de Verificación',
+                border: OutlineInputBorder(),
               ),
             ),
-            if (errorMessage.isNotEmpty) ...[
-              const SizedBox(height: 16),
-              Text(errorMessage, style: const TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
-            ],
-            const SizedBox(height: 16),
-            isVerifying
-                ? const CircularProgressIndicator()
-                : ElevatedButton(
-                    onPressed: verifyCode,
-                    style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 15)),
-                    child: Text(l.verifyCodeButton),
-                  ),
-            const SizedBox(height: 16),
-            _secondsRemaining > 0
-                ? Text(l.verifyCodeRetryIn(_secondsRemaining), style: const TextStyle(fontSize: 16))
-                : TextButton(onPressed: resendCode, child: Text(l.verifyCodeResend)),
+            const SizedBox(height: 12),
+            if (_error != null)
+              Text(
+                _error!,
+                style: const TextStyle(color: Colors.red),
+                textAlign: TextAlign.center,
+              ),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: _isVerifying ? null : _verify,
+              child: _isVerifying
+                  ? const SizedBox(
+                      height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Text('Verificar Código'),
+            ),
+            const SizedBox(height: 12),
+            const Text('Puedes reenviar el código en 60 segundos'),
           ],
         ),
       ),
