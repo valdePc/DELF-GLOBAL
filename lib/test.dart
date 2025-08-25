@@ -1,6 +1,4 @@
-import 'models/usuario.dart';
+// lib/test.dart
+void main() {}
 
-void main() {
-  final usuario = Usuario(nombre: "Valde", edad: 25);
-  print(usuario.toJson());
-}
+

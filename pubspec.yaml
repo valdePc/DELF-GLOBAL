@@ -23,12 +23,20 @@ dependencies:
   cloud_firestore: ^5.6.9
   google_sign_in: ^6.1.4
   uuid: ^4.5.1
-  image_picker: ^0.8.7+4
+  image_picker: ^1.1.2
   hive: ^2.2.3
   hive_flutter: ^1.1.0
   path_provider: ^2.0.15
   crypto: ^3.0.3
   firebase_auth: ^5.7.0
+  firebase_storage: ^12.3.5
+  share_plus: ^10.0.0
+  file_picker: ^8.0.6
+  url_launcher: ^6.3.0
+  cloud_functions: ^5.0.5
+  record: ^5.0.5
+  mime: ^2.0.0
+  
 
 dev_dependencies:
   flutter_test:
@@ -42,3 +50,8 @@ flutter:
   assets:
     - assets/google.png
     - assets/delf_logo.png
+
+
+analyzer:
+  exclude:
+    - lib/test.dart

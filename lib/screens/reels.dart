@@ -93,25 +93,46 @@ class _ReelsScreenState extends State<ReelsScreen>
     _initializeVideo(currentPage);
   }
 
-  @override
-  void dispose() {
-    _videoController?.dispose();
-    _rotationController.dispose();
-    _pageController.dispose();
-    super.dispose();
+@override
+void dispose() {
+  // pausa y libera el controller actual
+  _videoController?.pause();
+  _videoController?.dispose();
+  _rotationController.dispose();
+  _pageController.dispose();
+  super.dispose();
+}
+
+// Inicializa el vídeo para el reel en la posición [index]
+Future<void> _initializeVideo(int index) async {
+  // libera el anterior (si hay)
+  final prev = _videoController;
+  _videoController = null;
+  await prev?.pause();
+  await prev?.dispose();
+
+  final reel = reels[index];
+  final url = reel.videoUrl.trim();
+
+  // API nueva (recomendada)
+  final controller = VideoPlayerController.networkUrl(Uri.parse(url));
+
+  await controller.initialize();
+  controller.setLooping(true);
+  await controller.play();
+
+  if (!mounted) {
+    await controller.dispose();
+    return;
   }
 
-  // Inicializa el video para el reel en la posición [index]
-  Future<void> _initializeVideo(int index) async {
-    _videoController?.dispose();
-    final reel = reels[index];
-    _videoController = VideoPlayerController.network(reel.videoUrl)
-      ..initialize().then((_) {
-        setState(() {});
-        _videoController?.play();
-        _videoController?.setLooping(true);
-      });
-  }
+  setState(() {
+    _videoController = controller;
+  });
+}
+
+
+
 
   // Formatea la fecha/hora del reel
   String _formatDate(DateTime date) {

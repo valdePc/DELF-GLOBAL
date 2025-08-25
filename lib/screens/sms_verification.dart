@@ -1,7 +1,9 @@
+// lib/screens/sms_verification.dart
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart'; // <- NUEVO
 
 import 'principal.dart';
 
@@ -9,9 +11,21 @@ class SmsVerificationScreen extends StatefulWidget {
   final String fullName;
   final String phone;
   final DateTime? birthdate;
-  final String password;        // validación local únicamente
-  final String fx;              // id opcional de registro
-  final String verificationId;  // de verifyPhoneNumber()
+
+  /// NUEVO: email opcional capturado en registro
+  final String? email;
+
+  /// NUEVO: UID del invitador (si venimos de #/invite)
+  final String? referrerUid;
+
+  /// validación local únicamente
+  final String password;
+
+  /// id opcional de registro
+  final String fx;
+
+  /// de verifyPhoneNumber()
+  final String verificationId;
 
   const SmsVerificationScreen({
     super.key,
@@ -21,6 +35,8 @@ class SmsVerificationScreen extends StatefulWidget {
     required this.password,
     required this.fx,
     required this.verificationId,
+    this.email,         // <- NUEVO
+    this.referrerUid,   // <- NUEVO
   });
 
   @override
@@ -39,22 +55,40 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
   }
 
   Future<void> _saveProfile(User user) async {
-    final usersRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
-    await usersRef.set(
-      {
-        'uid': user.uid,
-        'fullName': widget.fullName,
-        'phone': widget.phone,
-        'birthdate': widget.birthdate != null
-            ? Timestamp.fromDate(widget.birthdate!)
-            : null,
-        'provider': 'phone',
-        'fx': widget.fx,
-        'updatedAt': FieldValue.serverTimestamp(),
-        'createdAt': FieldValue.serverTimestamp(),
-      },
-      SetOptions(merge: true),
-    );
+    // Evita auto-referirse
+    final referredBy = (widget.referrerUid != null &&
+            widget.referrerUid!.isNotEmpty &&
+            widget.referrerUid != user.uid)
+        ? widget.referrerUid
+        : null;
+
+    final usersRef =
+        FirebaseFirestore.instance.collection('users').doc(user.uid);
+
+await usersRef.set(
+  {
+    'uid': user.uid,
+    'fullName': widget.fullName,
+    'phone': widget.phone,
+    'email': widget.email, // opcional
+    'birthdate': widget.birthdate != null
+        ? Timestamp.fromDate(widget.birthdate!)
+        : null,
+    'provider': 'phone',
+    'fx': widget.fx,
+    'updatedAt': FieldValue.serverTimestamp(),
+    'createdAt': FieldValue.serverTimestamp(),
+    if (referredBy != null) 'referredBy': referredBy, // solo si existe
+  },
+  SetOptions(merge: true),
+);
+
+
+    // Limpia el referrer para no reutilizarlo posteriormente
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('referrer_uid');
+    } catch (_) {}
   }
 
   Future<void> _verify() async {
@@ -67,10 +101,11 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
     try {
       final smsCode = _codeCtrl.text.trim();
       if (smsCode.length < 6) {
-        throw FirebaseAuthException(code: 'invalid-code', message: 'Código inválido');
+        throw FirebaseAuthException(
+            code: 'invalid-code', message: 'Código inválido');
       }
 
-      // 1) Construir credencial y firmar con timeout
+      // 1) Construir credencial y firmar con timeout (como ya hacías)
       final cred = PhoneAuthProvider.credential(
         verificationId: widget.verificationId,
         smsCode: smsCode,
@@ -82,10 +117,11 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
 
       final user = userCred.user;
       if (user == null) {
-        throw FirebaseAuthException(code: 'no-user', message: 'No se pudo obtener el usuario');
+        throw FirebaseAuthException(
+            code: 'no-user', message: 'No se pudo obtener el usuario');
       }
 
-      // 2) Ir a la app de inmediato
+      // 2) Navega de inmediato a la app (manteniendo tu UX actual)
       if (!mounted) return;
       Navigator.pushAndRemoveUntil(
         context,
@@ -93,8 +129,7 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
         (_) => false,
       );
 
-      // 3) Guardar perfil en segundo plano (no bloquea la navegación)
-      //    Si falla, mostramos un aviso pero no interrumpimos la sesión.
+      // 3) Guarda el perfil en segundo plano (igual que tu versión)
       unawaited(
         _saveProfile(user).catchError((e) {
           if (mounted) {
@@ -105,7 +140,8 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
         }),
       );
     } on TimeoutException {
-      setState(() => _error = 'Tiempo de espera agotado. Verifica tu conexión e intenta de nuevo.');
+      setState(() => _error =
+          'Tiempo de espera agotado. Verifica tu conexión e intenta de nuevo.');
     } on FirebaseAuthException catch (e) {
       setState(() => _error = '${e.code}: ${e.message ?? ''}');
     } catch (e) {
@@ -125,7 +161,8 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            Text('Ingresa el código SMS que recibiste en el número $phoneShown'),
+            Text(
+                'Ingresa el código SMS que recibiste en el número $phoneShown'),
             const SizedBox(height: 12),
             TextField(
               controller: _codeCtrl,
@@ -137,13 +174,18 @@ class _SmsVerificationScreenState extends State<SmsVerificationScreen> {
             ),
             const SizedBox(height: 12),
             if (_error != null)
-              Text(_error!, style: const TextStyle(color: Colors.red), textAlign: TextAlign.center),
+              Text(_error!,
+                  style: const TextStyle(color: Colors.red),
+                  textAlign: TextAlign.center),
             const SizedBox(height: 12),
             ElevatedButton(
               onPressed: _isVerifying ? null : _verify,
               child: _isVerifying
                   ? const SizedBox(
-                      height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                      height: 18,
+                      width: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
                   : const Text('Verificar Código'),
             ),
             const SizedBox(height: 12),

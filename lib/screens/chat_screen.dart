@@ -1,18 +1,41 @@
+// lib/chat_screen.dart — versión pulida
+// Mejoras clave:
+// - Traducción al tocar cualquier mensaje de texto (no solo los enviados).
+// - Autoscroll con animación suave.
+// - Validación de adjuntos (MIME/tamaño) antes de subir.
+// - Mini ChatRepository para aislar IO (Firestore/Storage).
+// - Ticks de "visto" para mensajes enviados.
+
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:record/record.dart' as rec;
+import 'package:mime/mime.dart';
 
-/// Modelo de mensaje:
-/// - [isSeen]: indica si el mensaje fue visto.
-/// - [reaction]: reacción tipo emoji (por ejemplo: '❤️', '👍', etc.).
+// ===================== MODELO =====================
 class Message {
   final String id;
+  final String type; // 'text' | 'image' | 'video' | 'audio' | 'file'
   final String text;
-  final bool isSent;
+  final String? url;
+  final String? fileName;
+  final String? mimeType;
+  final int? fileSize;
+  final int? durationMs;
+  final int? width;
+  final int? height;
+  final bool isSent; // true si lo envié yo
   final DateTime timestamp;
   final String? translatedText;
   final bool isSeen;
@@ -20,9 +43,17 @@ class Message {
 
   Message({
     required this.id,
+    required this.type,
     required this.text,
     required this.isSent,
     required this.timestamp,
+    this.url,
+    this.fileName,
+    this.mimeType,
+    this.fileSize,
+    this.durationMs,
+    this.width,
+    this.height,
     this.translatedText,
     this.isSeen = false,
     this.reaction,
@@ -30,18 +61,34 @@ class Message {
 
   Message copyWith({
     String? id,
+    String? type,
     String? text,
     bool? isSent,
     DateTime? timestamp,
+    String? url,
+    String? fileName,
+    String? mimeType,
+    int? fileSize,
+    int? durationMs,
+    int? width,
+    int? height,
     String? translatedText,
     bool? isSeen,
     String? reaction,
   }) {
     return Message(
       id: id ?? this.id,
+      type: type ?? this.type,
       text: text ?? this.text,
       isSent: isSent ?? this.isSent,
       timestamp: timestamp ?? this.timestamp,
+      url: url ?? this.url,
+      fileName: fileName ?? this.fileName,
+      mimeType: mimeType ?? this.mimeType,
+      fileSize: fileSize ?? this.fileSize,
+      durationMs: durationMs ?? this.durationMs,
+      width: width ?? this.width,
+      height: height ?? this.height,
       translatedText: translatedText ?? this.translatedText,
       isSeen: isSeen ?? this.isSeen,
       reaction: reaction ?? this.reaction,
@@ -49,22 +96,49 @@ class Message {
   }
 
   factory Message.fromMap(String id, Map<String, dynamic> map) {
+    final me = FirebaseAuth.instance.currentUser?.uid;
+    final ts = map['timestamp'];
+    DateTime when;
+    if (ts is Timestamp) {
+      when = ts.toDate();
+    } else if (ts is DateTime) {
+      when = ts;
+    } else {
+      when = DateTime.now();
+    }
+
     return Message(
       id: id,
+      type: (map['type'] as String?) ?? 'text',
       text: map['text'] ?? '',
-      isSent: map['de'] == FirebaseAuth.instance.currentUser?.uid,
-      timestamp: (map['timestamp'] as Timestamp).toDate(),
-      translatedText: map['translatedText'],
-      isSeen: map['isSeen'] ?? false,
-      reaction: map['reaction'],
+      url: map['url'] as String?,
+      fileName: map['fileName'] as String?,
+      mimeType: map['mimeType'] as String?,
+      fileSize: (map['fileSize'] as num?)?.toInt(),
+      durationMs: (map['durationMs'] as num?)?.toInt(),
+      width: (map['width'] as num?)?.toInt(),
+      height: (map['height'] as num?)?.toInt(),
+      isSent: map['de'] == me,
+      timestamp: when,
+      translatedText: map['translatedText'] as String?,
+      isSeen: (map['isSeen'] as bool?) ?? false,
+      reaction: map['reaction'] as String?,
     );
   }
 
   Map<String, dynamic> toMap() {
     return {
+      'type': type,
       'text': text,
+      'url': url,
+      'fileName': fileName,
+      'mimeType': mimeType,
+      'fileSize': fileSize,
+      'durationMs': durationMs,
+      'width': width,
+      'height': height,
       'de': FirebaseAuth.instance.currentUser?.uid,
-      'timestamp': timestamp,
+      'timestamp': FieldValue.serverTimestamp(), // siempre server time
       'translatedText': translatedText,
       'isSeen': isSeen,
       'reaction': reaction,
@@ -72,7 +146,50 @@ class Message {
   }
 }
 
+// ===================== REPOSITORIO =====================
+class ChatRepository {
+  final FirebaseFirestore _db;
+  final FirebaseStorage _storage;
+  ChatRepository({FirebaseFirestore? db, FirebaseStorage? storage})
+      : _db = db ?? FirebaseFirestore.instance,
+        _storage = storage ?? FirebaseStorage.instance;
 
+  DocumentReference<Map<String, dynamic>> chatDoc(String chatId) =>
+      _db.collection('chats').doc(chatId);
+
+  Stream<QuerySnapshot<Map<String, dynamic>>> mensajesStream(String chatId) =>
+      chatDoc(chatId).collection('mensajes').orderBy('timestamp').snapshots();
+
+  Future<void> upsertChatMeta(String chatId, String ultimo) async {
+    await chatDoc(chatId).set({
+      'id': chatId,
+      'ultimoMensaje': ultimo,
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
+  Future<void> addMensaje(String chatId, Map<String, dynamic> data) async {
+    await chatDoc(chatId).collection('mensajes').add(data);
+  }
+
+  Future<String> uploadBytes(String path, List<int> bytes,
+      {required String contentType}) async {
+    final task = _storage
+        .ref(path)
+        .putData(Uint8List.fromList(bytes), SettableMetadata(contentType: contentType));
+    final snap = await task;
+    return await snap.ref.getDownloadURL();
+  }
+
+  Future<String> uploadFile(String path, File f, {required String contentType}) async {
+    final task =
+        _storage.ref(path).putFile(f, SettableMetadata(contentType: contentType));
+    final snap = await task;
+    return await snap.ref.getDownloadURL();
+  }
+}
+
+// ===================== UI (ChatScreen) =====================
 class ChatScreen extends StatefulWidget {
   final String contactName;
   final String phone;
@@ -92,207 +209,397 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  /// Lista simulada inicial de mensajes con el nombre del contacto incluido.
-  late List<Message> messages;
+  // Estado
+  List<Message> messages = [];
 
-  /// Controladores y estados:
-  final TextEditingController _messageController = TextEditingController();
-  final TextEditingController _searchController = TextEditingController();
+  // UI
+  final _messageController = TextEditingController();
+  final _searchController = TextEditingController();
+  final _listCtrl = ScrollController();
 
-  /// Modo de búsqueda activo/inactivo.
   bool searchMode = false;
-
-  /// Idioma seleccionado para traducción.
   String selectedLanguage = 'en';
-
-  /// Término de búsqueda actual.
   String filterQuery = '';
-
-  /// Ruta de la imagen de fondo del chat (seleccionada por el usuario).
   String? chatBackgroundPath;
 
-  /// Para saber cuál es el último mensaje del contacto (isSent = false).
-  /// Solo en ese último mensaje (del contacto) se mostrará el avatar.
-  int get lastContactMessageIndex {
-    return filteredMessages.lastIndexWhere((m) => m.isSent == false);
+  // Audio
+  late final rec.AudioRecorder _recorder;
+  bool _isRecording = false;
+
+  // Repo
+  late final ChatRepository _repo;
+
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _mensajesSub;
+
+  // Límites adjuntos
+  static const int _mb = 1024 * 1024;
+  static const int _maxImage = 10 * _mb;
+  static const int _maxVideo = 50 * _mb;
+  static const int _maxAudio = 20 * _mb;
+  static const int _maxFile = 25 * _mb;
+
+  @override
+  void initState() {
+    super.initState();
+    _repo = ChatRepository();
+    _recorder = rec.AudioRecorder();
+
+    final currentUser = FirebaseAuth.instance.currentUser;
+    if (currentUser == null) {
+      debugPrint('Usuario no autenticado.');
+      return;
+    }
+
+    _messageController.addListener(() => setState(() {}));
+    _listenToMessages();
   }
 
-
-
-
-late StreamSubscription<QuerySnapshot> _mensajesSub;
-
-@override
-void initState() {
-  super.initState();
-
-  final currentUser = FirebaseAuth.instance.currentUser;
-  if (currentUser == null) {
-    // Redirige al login o lanza un error si es necesario
-    print("Usuario no autenticado.");
-    return;
+  @override
+  void dispose() {
+    _mensajesSub?.cancel();
+    _messageController.dispose();
+    _searchController.dispose();
+    _listCtrl.dispose();
+    _recorder.dispose();
+    super.dispose();
   }
 
-  messages = [];
-  _messageController.addListener(() => setState(() {}));
-  _listenToMessages();
-}
-
-void _listenToMessages() {
-  final mensajesRef = FirebaseFirestore.instance
-      .collection('chats')
-      .doc(widget.chatId)
-      .collection('mensajes')
-      .orderBy('timestamp');
-
-  _mensajesSub = mensajesRef.snapshots().listen((snapshot) {
-    final nuevos = snapshot.docs
-       .map((doc) => Message.fromMap(doc.id, doc.data()))
-        .toList();
-
-    setState(() {
-      messages = nuevos;
-    });
-
-    _translateReceivedMessages(); // Traduce si aún no estaban traducidos
-  });
-}
-
-@override
-void dispose() {
-  _mensajesSub.cancel();
-  _messageController.dispose();
-  _searchController.dispose();
-  super.dispose();
-}
-
-
-
-  /// Función simulada de traducción.
-  Future<String> translateText(String text, String targetLang) async {
-    await Future.delayed(const Duration(milliseconds: 500));
-    return '[$targetLang] $text';
+  Future<void> _startRecordingCompat(rec.RecordConfig cfg) async {
+    try {
+      await (_recorder as dynamic).start(config: cfg);
+    } catch (_) {
+      await (_recorder as dynamic).start(cfg);
+    }
   }
 
-  /// Envía un mensaje de texto.
-void _sendMessage() async {
-  if (_messageController.text.trim().isEmpty) return;
+  Future<void> _changeChatBackground() async {
+    final picker = ImagePicker();
+    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
+    if (pickedFile != null) {
+      setState(() => chatBackgroundPath = pickedFile.path);
+    }
+  }
 
-  final newMsg = Message(
-    id: '', // Lo generará Firestore
-    text: _messageController.text.trim(),
-    isSent: true,
-    timestamp: DateTime.now(),
-  );
+  Future<void> _markIncomingAsSeen(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
+  ) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
 
-  _messageController.clear();
+    final batch = FirebaseFirestore.instance.batch();
+    int toUpdate = 0;
 
-  final mensajesRef = FirebaseFirestore.instance
-      .collection('chats')
-      .doc(widget.chatId)
-      .collection('mensajes');
+    for (final d in docs) {
+      final data = d.data();
+      final fromOther = data['de'] != uid;
+      final isSeen = (data['isSeen'] as bool?) ?? false;
+      if (fromOther && !isSeen) {
+        batch.update(d.reference, {'isSeen': true});
+        toUpdate++;
+      }
+    }
+    if (toUpdate > 0) await batch.commit();
+  }
 
-  await mensajesRef.add(newMsg.toMap());
-
-  // Actualizar el chat principal
-  await FirebaseFirestore.instance.collection('chats').doc(widget.chatId).update({
-    'ultimoMensaje': newMsg.text,
-    'timestamp': FieldValue.serverTimestamp(),
-  });
-}
-
-
-  /// Graba y envía un mensaje de audio (ejemplo básico).
-  Future<void> _sendAudioMessage() async {
-    await Future.delayed(const Duration(seconds: 1));
-    final audioMsg = Message(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      text: 'Audio enviado (simulado)',
-      isSent: true,
-      timestamp: DateTime.now(),
+  Widget _buildBackground() {
+    if (chatBackgroundPath == null) return Container(color: Colors.grey[200]);
+    if (kIsWeb) return Container(color: Colors.grey[200]);
+    return Container(
+      decoration: BoxDecoration(
+        image: DecorationImage(
+          image: FileImage(File(chatBackgroundPath!)),
+          fit: BoxFit.cover,
+        ),
+      ),
     );
-    setState(() {
-      messages.add(audioMsg);
+  }
+
+  void _listenToMessages() {
+    _mensajesSub = _repo.mensajesStream(widget.chatId).listen((snapshot) async {
+      final nuevos =
+          snapshot.docs.map((d) => Message.fromMap(d.id, d.data())).toList();
+      setState(() => messages = nuevos);
+
+      // autoscroll suave
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (_listCtrl.hasClients) {
+          await _listCtrl.animateTo(
+            _listCtrl.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeOut,
+          );
+        }
+      });
+
+      await _markIncomingAsSeen(snapshot.docs);
+      _translateReceivedMessages();
     });
   }
 
-  /// Adjunta un archivo: foto, video o documento.
+  // ===================== ENVÍO =====================
+  Future<void> _sendMessage() async {
+    final txt = _messageController.text.trim();
+    if (txt.isEmpty) return;
+    _messageController.clear();
+
+    try {
+      final uid = FirebaseAuth.instance.currentUser!.uid;
+      await _repo.upsertChatMeta(widget.chatId, txt);
+      await _repo.addMensaje(widget.chatId, {
+        'type': 'text',
+        'text': txt,
+        'de': uid,
+        'timestamp': FieldValue.serverTimestamp(),
+        'isSeen': false,
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('No se pudo enviar: $e')));
+    }
+  }
+
+// ignore: unused_element  IGNORADO PARA LUEGO XXX
+Future<void> _sendSystemText(String text) async {
+    final uid = FirebaseAuth.instance.currentUser!.uid;
+    await _repo.upsertChatMeta(widget.chatId, text);
+    await _repo.addMensaje(widget.chatId, {
+      'type': 'text',
+      'text': text,
+      'de': uid,
+      'timestamp': FieldValue.serverTimestamp(),
+      'isSeen': false,
+    });
+  }
+
+  // ===================== VALIDACIONES =====================
+  bool _checkLimitAndMime({
+    required String type,
+    required String fileName,
+    required int size,
+    required String mime,
+  }) {
+    bool ok = true;
+    String? error;
+
+    if (type == 'image') {
+      if (!mime.startsWith('image/')) error = 'Formato de imagen no válido';
+      if (size > _maxImage) error = 'Imagen supera ${_maxImage ~/ _mb}MB';
+    } else if (type == 'video') {
+      if (!mime.startsWith('video/')) error = 'Formato de video no válido';
+      if (size > _maxVideo) error = 'Video supera ${_maxVideo ~/ _mb}MB';
+    } else if (type == 'audio') {
+      if (!mime.startsWith('audio/')) error = 'Formato de audio no válido';
+      if (size > _maxAudio) error = 'Audio supera ${_maxAudio ~/ _mb}MB';
+    } else {
+      if (size > _maxFile) error = 'Archivo supera ${_maxFile ~/ _mb}MB';
+    }
+
+    if (error != null) {
+      ok = false;
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(error)));
+      }
+    }
+    return ok;
+  }
+
+  // ===================== STORAGE + MENSAJES =====================
+  Future<void> _uploadAndSendXFile(XFile xf, String type) async {
+    final uid = FirebaseAuth.instance.currentUser!.uid;
+    final fileName = xf.name;
+    final mime = lookupMimeType(fileName) ?? 'application/octet-stream';
+
+    UploadTask task;
+    int size = 0;
+    final storagePath =
+        'chats/${widget.chatId}/$uid/${DateTime.now().millisecondsSinceEpoch}_$fileName';
+
+    if (kIsWeb) {
+      final bytes = await xf.readAsBytes();
+      size = bytes.length;
+      if (!_checkLimitAndMime(type: type, fileName: fileName, size: size, mime: mime)) return;
+      task = FirebaseStorage.instance
+          .ref(storagePath)
+          .putData(bytes, SettableMetadata(contentType: mime));
+    } else {
+      final f = File(xf.path);
+      size = await f.length();
+      if (!_checkLimitAndMime(type: type, fileName: fileName, size: size, mime: mime)) return;
+      task = FirebaseStorage.instance
+          .ref(storagePath)
+          .putFile(f, SettableMetadata(contentType: mime));
+    }
+
+    final snap = await task;
+    final url = await snap.ref.getDownloadURL();
+
+    final ultimo = (type == 'image')
+        ? '📷 Imagen'
+        : (type == 'video')
+            ? '🎬 Video'
+            : (type == 'audio')
+                ? '🎙️ Audio'
+                : '📎 Archivo';
+
+    await _repo.upsertChatMeta(widget.chatId, ultimo);
+    await _repo.addMensaje(widget.chatId, {
+      'type': type,
+      'text': '',
+      'url': url,
+      'fileName': fileName,
+      'mimeType': mime,
+      'fileSize': size,
+      'de': uid,
+      'timestamp': FieldValue.serverTimestamp(),
+      'isSeen': false,
+    });
+  }
+
+  Future<void> _uploadAndSendPlatformFile(PlatformFile pf, String type) async {
+    final uid = FirebaseAuth.instance.currentUser!.uid;
+    final fileName = pf.name;
+
+    String mime = lookupMimeType(fileName) ?? 'application/octet-stream';
+    int size = pf.size;
+
+    final storagePath =
+        'chats/${widget.chatId}/$uid/${DateTime.now().millisecondsSinceEpoch}_$fileName';
+
+    if (!_checkLimitAndMime(type: type, fileName: fileName, size: size, mime: mime)) return;
+
+    UploadTask task;
+    if (kIsWeb || pf.bytes != null) {
+      final bytes = pf.bytes!;
+      task = FirebaseStorage.instance
+          .ref(storagePath)
+          .putData(bytes, SettableMetadata(contentType: mime));
+    } else {
+      final f = File(pf.path!);
+      task = FirebaseStorage.instance
+          .ref(storagePath)
+          .putFile(f, SettableMetadata(contentType: mime));
+    }
+
+    final snap = await task;
+    final url = await snap.ref.getDownloadURL();
+
+    final ultimo = (type == 'image')
+        ? '📷 Imagen'
+        : (type == 'video')
+            ? '🎬 Video'
+            : (type == 'audio')
+                ? '🎙️ Audio'
+                : '📎 Archivo';
+
+    await _repo.upsertChatMeta(widget.chatId, ultimo);
+    await _repo.addMensaje(widget.chatId, {
+      'type': type,
+      'text': '',
+      'url': url,
+      'fileName': fileName,
+      'mimeType': mime,
+      'fileSize': size,
+      'de': uid,
+      'timestamp': FieldValue.serverTimestamp(),
+      'isSeen': false,
+    });
+  }
+
+  // Adjuntar
   Future<void> _sendAttachment(String type) async {
     if (type == 'Foto') {
       final picker = ImagePicker();
-      final pickedFile = await picker.pickImage(source: ImageSource.gallery);
-      if (pickedFile != null) {
-        final attachmentMsg = Message(
-          id: DateTime.now().millisecondsSinceEpoch.toString(),
-          text: 'Foto adjunta: ${pickedFile.path.split('/').last}',
-          isSent: true,
-          timestamp: DateTime.now(),
-        );
-        setState(() {
-          messages.add(attachmentMsg);
-        });
-      }
+      final picked = await picker.pickImage(source: ImageSource.gallery);
+      if (picked != null) await _uploadAndSendXFile(picked, 'image');
     } else if (type == 'Video') {
       final picker = ImagePicker();
-      final pickedFile = await picker.pickVideo(source: ImageSource.gallery);
-      if (pickedFile != null) {
-        final attachmentMsg = Message(
-          id: DateTime.now().millisecondsSinceEpoch.toString(),
-          text: 'Video adjunto: ${pickedFile.path.split('/').last}',
-          isSent: true,
-          timestamp: DateTime.now(),
-        );
-        setState(() {
-          messages.add(attachmentMsg);
-        });
-      }
+      final picked = await picker.pickVideo(source: ImageSource.gallery);
+      if (picked != null) await _uploadAndSendXFile(picked, 'video');
     } else if (type == 'Documento') {
-      final docMsg = Message(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
-        text: 'Documento adjunto (simulado)',
-        isSent: true,
-        timestamp: DateTime.now(),
+      final res = await FilePicker.platform.pickFiles(
+        allowMultiple: false,
+        withData: kIsWeb,
+        type: FileType.any,
       );
-      setState(() {
-        messages.add(docMsg);
-      });
+      if (res != null && res.files.isNotEmpty) {
+        await _uploadAndSendPlatformFile(res.files.single, 'file');
+      }
     }
   }
 
-  /// Envía imagen/video desde la cámara (simulado).
+  // Cámara directa
   Future<void> _sendCameraMedia(String mode) async {
     final picker = ImagePicker();
     if (mode == 'Foto') {
-      final pickedFile = await picker.pickImage(source: ImageSource.camera);
-      if (pickedFile != null) {
-        final cameraMsg = Message(
-          id: DateTime.now().millisecondsSinceEpoch.toString(),
-          text: 'Foto con cámara: ${pickedFile.path.split('/').last}',
-          isSent: true,
-          timestamp: DateTime.now(),
-        );
-        setState(() {
-          messages.add(cameraMsg);
-        });
+      final f = await picker.pickImage(source: ImageSource.camera);
+      if (f != null) await _uploadAndSendXFile(f, 'image');
+    } else {
+      final f = await picker.pickVideo(source: ImageSource.camera);
+      if (f != null) await _uploadAndSendXFile(f, 'video');
+    }
+  }
+
+  // Audio
+  Future<void> _sendAudioMessage() async {
+    if (kIsWeb) {
+      final res = await FilePicker.platform.pickFiles(
+        allowMultiple: false,
+        withData: true,
+        type: FileType.custom,
+        allowedExtensions: ['mp3', 'm4a', 'aac', 'wav', 'ogg'],
+      );
+      if (res != null && res.files.isNotEmpty) {
+        await _uploadAndSendPlatformFile(res.files.single, 'audio');
       }
-    } else if (mode == 'Video') {
-      final pickedFile = await picker.pickVideo(source: ImageSource.camera);
-      if (pickedFile != null) {
-        final cameraMsg = Message(
-          id: DateTime.now().millisecondsSinceEpoch.toString(),
-          text: 'Video con cámara: ${pickedFile.path.split('/').last}',
-          isSent: true,
-          timestamp: DateTime.now(),
-        );
-        setState(() {
-          messages.add(cameraMsg);
-        });
+      return;
+    }
+
+    final ok = await _recorder.hasPermission();
+    if (!ok) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Permiso de micrófono denegado')),
+      );
+      return;
+    }
+
+    if (!_isRecording) {
+      await _startRecordingCompat(
+        rec.RecordConfig(
+          encoder: rec.AudioEncoder.aacLc,
+          bitRate: 128000,
+          sampleRate: 44100,
+        ),
+      );
+      setState(() => _isRecording = true);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Grabando... toca el mic para detener')),
+      );
+    } else {
+      final path = await _recorder.stop();
+      setState(() => _isRecording = false);
+      if (path != null) {
+        await _uploadAndSendXFile(XFile(path), 'audio');
       }
     }
   }
 
-  /// Editar mensaje (si han pasado menos de 15 minutos).
+  // ===================== EDICIÓN / REACCIONES =====================
+  Future<void> _updateMessageText(Message message, String newText) async {
+    if (message.id.isEmpty) return;
+    await FirebaseFirestore.instance
+        .collection('chats')
+        .doc(widget.chatId)
+        .collection('mensajes')
+        .doc(message.id)
+        .update({'text': newText});
+  }
+
   void _editMessage(Message message) async {
+    if (message.type != 'text') return;
     final now = DateTime.now();
     if (now.difference(message.timestamp).inMinutes > 15) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -300,153 +607,238 @@ void _sendMessage() async {
       );
       return;
     }
+
     String editedText = message.text;
     await showDialog(
       context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text('Editar mensaje'),
-          content: TextField(
-            autofocus: true,
-            decoration: const InputDecoration(hintText: 'Nuevo mensaje'),
-            onChanged: (value) => editedText = value,
-            controller: TextEditingController(text: message.text),
+      builder: (context) => AlertDialog(
+        title: const Text('Editar mensaje'),
+        content: TextField(
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'Nuevo mensaje'),
+          onChanged: (v) => editedText = v,
+          controller: TextEditingController(text: message.text),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancelar')),
+          TextButton(
+            onPressed: () async {
+              await _updateMessageText(message, editedText);
+              Navigator.pop(context);
+            },
+            child: const Text('Guardar'),
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Cancelar'),
-            ),
-            TextButton(
-              onPressed: () {
-                final index = messages.indexOf(message);
-                setState(() {
-                  messages[index] = message.copyWith(text: editedText);
-                });
-                Navigator.of(context).pop();
-              },
-              child: const Text('Guardar'),
-            ),
-          ],
-        );
-      },
+        ],
+      ),
     );
   }
 
-  /// Al presionar un mensaje enviado, se traduce al idioma seleccionado.
-  void _onMessagePressed(Message message) async {
-    if (message.isSent) {
-      final translation = await translateText(message.text, selectedLanguage);
-      final index = messages.indexOf(message);
-      if (index != -1) {
-        setState(() {
-          messages[index] = message.copyWith(translatedText: translation);
-        });
-      }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Traducción: $translation')),
-      );
-    }
+  Future<void> _setReaction(Message message, String emoji) async {
+    if (message.id.isEmpty) return;
+    await FirebaseFirestore.instance
+        .collection('chats')
+        .doc(widget.chatId)
+        .collection('mensajes')
+        .doc(message.id)
+        .update({'reaction': emoji});
   }
 
-  /// Traduce automáticamente los mensajes recibidos.
- void _translateReceivedMessages() async {
-  bool hasChanges = false;
-
-  for (int i = 0; i < messages.length; i++) {
-    final msg = messages[i];
-    if (!msg.isSent && msg.translatedText == null) {
-      final translation = await translateText(msg.text, selectedLanguage);
-      messages[i] = msg.copyWith(translatedText: translation);
-      hasChanges = true;
-    }
-  }
-
-  if (hasChanges) {
-    setState(() {});
-  }
-}
-
-  /// Muestra las reacciones al hacer doble toque en el mensaje.
   void _showReactionOptions(Message message) async {
-    List<String> reactions = ['👍', '❤️', '😂', '😮', '😢', '👏'];
-    final selectedReaction = await showModalBottomSheet<String>(
+    final reactions = ['👍', '❤️', '😂', '😮', '😢', '👏'];
+    final selected = await showModalBottomSheet<String>(
       context: context,
-      builder: (context) {
-        return Container(
-          padding: const EdgeInsets.all(16),
-          height: 80,
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: reactions.map((reaction) {
-              return GestureDetector(
-                onTap: () => Navigator.pop(context, reaction),
-                child: Text(
-                  reaction,
-                  style: const TextStyle(fontSize: 24),
-                ),
-              );
-            }).toList(),
-          ),
-        );
-      },
+      builder: (_) => SizedBox(
+        height: 80,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: reactions
+              .map((r) => GestureDetector(
+                    onTap: () => Navigator.pop(context, r),
+                    child: Text(r, style: const TextStyle(fontSize: 24)),
+                  ))
+              .toList(),
+        ),
+      ),
     );
-    if (selectedReaction != null) {
-      final index = messages.indexOf(message);
-      if (index != -1) {
-        setState(() {
-          messages[index] = message.copyWith(reaction: selectedReaction);
-        });
-      }
+    if (selected != null) await _setReaction(message, selected);
+  }
+
+  // ===================== TRADUCCIÓN =====================
+  Future<String?> translateText(String text, String targetLang) async {
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable('translateText');
+      final res = await callable.call({'text': text, 'target': targetLang});
+      final data = res.data as Map;
+      return data['translation'] as String?;
+    } catch (_) {
+      return null;
     }
   }
 
-  /// Cambia el fondo del chat seleccionando una imagen de la galería.
-  Future<void> _changeChatBackground() async {
-    final picker = ImagePicker();
-    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
-    if (pickedFile != null) {
+  void _onMessagePressed(Message message) async {
+    // FIX: permitir traducir cualquier mensaje de texto (entrante o saliente)
+    if (message.type != 'text') return;
+
+    final translation = await translateText(message.text, selectedLanguage);
+    if (translation == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Traducción no disponible')));
+      return;
+    }
+
+    final index = messages.indexOf(message);
+    if (index != -1) {
       setState(() {
-        chatBackgroundPath = pickedFile.path;
+        messages[index] = message.copyWith(translatedText: translation);
       });
     }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('Traducción: $translation')));
   }
 
-  /// Determina si dos fechas corresponden al mismo día.
-  bool isSameDate(DateTime d1, DateTime d2) {
-    return d1.year == d2.year && d1.month == d2.month && d1.day == d2.day;
+  void _translateReceivedMessages() async {
+    bool hasChanges = false;
+    for (int i = 0; i < messages.length; i++) {
+      final msg = messages[i];
+      if (!msg.isSent && msg.type == 'text' && msg.translatedText == null) {
+        final translation = await translateText(msg.text, selectedLanguage);
+        if (translation != null) {
+          messages[i] = msg.copyWith(translatedText: translation);
+          hasChanges = true;
+        }
+      }
+    }
+    if (hasChanges) setState(() {});
   }
 
-  /// Obtiene la lista de mensajes filtrados por texto (búsqueda).
+  // ===================== HELPERS UI =====================
+  bool isSameDate(DateTime d1, DateTime d2) =>
+      d1.year == d2.year && d1.month == d2.month && d1.day == d2.day;
+
   List<Message> get filteredMessages {
     if (filterQuery.isNotEmpty) {
       return messages
-          .where((m) => m.text.toLowerCase().contains(filterQuery.toLowerCase()))
+          .where((m) => (m.text).toLowerCase().contains(filterQuery.toLowerCase()) ||
+              (m.fileName ?? '').toLowerCase().contains(filterQuery.toLowerCase()) ||
+              m.type.toLowerCase().contains(filterQuery.toLowerCase()))
           .toList();
     }
     return messages;
   }
 
-  /// Construye cada ítem de la lista de mensajes, con separadores de fecha y avatar.
+  Future<void> _openUrl(String url) async {
+    final uri = Uri.parse(url);
+    await launchUrl(uri, mode: LaunchMode.externalApplication);
+  }
+
+  Widget _ticks(bool seen) => Icon(
+        seen ? Icons.done_all : Icons.done,
+        size: 14,
+        color: seen ? Colors.blue : Colors.grey,
+      );
+
+  Widget _messageBubble(Message msg) {
+    Widget inner;
+
+    if (msg.type == 'image' && msg.url != null) {
+      inner = Column(
+        crossAxisAlignment:
+            msg.isSent ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Image.network(msg.url!, fit: BoxFit.cover),
+          ),
+          if ((msg.fileName ?? '').isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(msg.fileName!, style: const TextStyle(fontSize: 12)),
+          ],
+        ],
+      );
+    } else if ((msg.type == 'video' || msg.type == 'audio' || msg.type == 'file') &&
+        msg.url != null) {
+      final icon = msg.type == 'video'
+          ? Icons.videocam
+          : (msg.type == 'audio' ? Icons.audiotrack : Icons.insert_drive_file);
+      inner = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              msg.fileName ?? (msg.type.toUpperCase()),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          TextButton(onPressed: () => _openUrl(msg.url!), child: const Text('Abrir')),
+        ],
+      );
+    } else {
+      inner = Column(
+        crossAxisAlignment:
+            msg.isSent ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(msg.text),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                DateFormat('HH:mm').format(msg.timestamp),
+                style: TextStyle(fontSize: 10, color: Colors.grey[600]),
+              ),
+              if (msg.isSent) ...[
+                const SizedBox(width: 6),
+                _ticks(msg.isSeen),
+              ]
+            ],
+          ),
+          if (msg.translatedText != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4.0),
+              child: Text(
+                msg.translatedText!,
+                style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
+              ),
+            ),
+        ],
+      );
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 4),
+      padding: const EdgeInsets.all(8.0),
+      decoration: BoxDecoration(
+        color: msg.isSent ? Colors.blue[100] : Colors.grey[300],
+        borderRadius: BorderRadius.circular(8.0),
+      ),
+      child: inner,
+    );
+  }
+
+  int get lastContactMessageIndex {
+    return filteredMessages.lastIndexWhere((m) => m.isSent == false);
+  }
+
   Widget _buildMessageItem(int index) {
     final msg = filteredMessages[index];
 
-    // Determinar si mostramos el separador de fecha.
     bool showDateHeader = false;
     if (index == 0) {
       showDateHeader = true;
     } else {
       final prevMsg = filteredMessages[index - 1];
-      if (!isSameDate(prevMsg.timestamp, msg.timestamp)) {
-        showDateHeader = true;
-      }
+      if (!isSameDate(prevMsg.timestamp, msg.timestamp)) showDateHeader = true;
     }
 
-    // Solo en el último mensaje del contacto (isSent=false) mostramos el avatar.
-    bool showAvatar = false;
-    if (!msg.isSent && index == lastContactMessageIndex) {
-      showAvatar = true;
-    }
+    bool showAvatar = (!msg.isSent && index == lastContactMessageIndex);
 
     return Column(
       crossAxisAlignment:
@@ -472,7 +864,7 @@ void _sendMessage() async {
         GestureDetector(
           onTap: () => _onMessagePressed(msg),
           onDoubleTap: () => _showReactionOptions(msg),
-          onLongPress: msg.isSent ? () => _editMessage(msg) : null,
+          onLongPress: msg.isSent && msg.type == 'text' ? () => _editMessage(msg) : null,
           child: Row(
             mainAxisAlignment:
                 msg.isSent ? MainAxisAlignment.end : MainAxisAlignment.start,
@@ -483,42 +875,18 @@ void _sendMessage() async {
                   padding: const EdgeInsets.only(right: 8.0),
                   child: CircleAvatar(
                     radius: 12,
-                    backgroundImage: const AssetImage('assets/profile_small.png'),
+                    backgroundImage: (widget.profilePic != null &&
+                            widget.profilePic!.isNotEmpty)
+                        ? (kIsWeb || widget.profilePic!.startsWith('http')
+                            ? NetworkImage(widget.profilePic!)
+                            : FileImage(File(widget.profilePic!)) as ImageProvider)
+                        : null,
+                    child: (widget.profilePic == null || widget.profilePic!.isEmpty)
+                        ? const Icon(Icons.person, size: 16)
+                        : null,
                   ),
                 ),
-              Flexible(
-                child: Container(
-                  margin: const EdgeInsets.only(bottom: 4),
-                  padding: const EdgeInsets.all(8.0),
-                  decoration: BoxDecoration(
-                    color: msg.isSent ? Colors.blue[100] : Colors.grey[300],
-                    borderRadius: BorderRadius.circular(8.0),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: msg.isSent
-                        ? CrossAxisAlignment.end
-                        : CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(msg.text),
-                      const SizedBox(height: 4),
-                      Text(
-                        DateFormat('HH:mm').format(msg.timestamp),
-                        style: TextStyle(fontSize: 10, color: Colors.grey[600]),
-                      ),
-                      if (msg.translatedText != null)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 4.0),
-                          child: Text(
-                            msg.translatedText!,
-                            style: const TextStyle(
-                                fontSize: 12, fontStyle: FontStyle.italic),
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
+              Flexible(child: _messageBubble(msg)),
             ],
           ),
         ),
@@ -531,19 +899,14 @@ void _sendMessage() async {
               top: 2,
             ),
             child: Align(
-              alignment:
-                  msg.isSent ? Alignment.centerRight : Alignment.centerLeft,
-              child: Text(
-                msg.reaction!,
-                style: const TextStyle(fontSize: 20),
-              ),
+              alignment: msg.isSent ? Alignment.centerRight : Alignment.centerLeft,
+              child: Text(msg.reaction!, style: const TextStyle(fontSize: 20)),
             ),
           ),
       ],
     );
   }
 
-  /// ÚNICO método para construir el campo de búsqueda.
   Widget _buildSearchField() {
     return TextField(
       controller: _searchController,
@@ -552,17 +915,11 @@ void _sendMessage() async {
         hintText: 'Buscar mensajes...',
         border: InputBorder.none,
       ),
-      onChanged: (value) {
-        setState(() {
-          filterQuery = value;
-        });
-      },
-      onSubmitted: (value) {
-        setState(() {
-          filterQuery = value;
-          searchMode = false;
-        });
-      },
+      onChanged: (value) => setState(() => filterQuery = value),
+      onSubmitted: (value) => setState(() {
+        filterQuery = value;
+        searchMode = false;
+      }),
     );
   }
 
@@ -576,50 +933,49 @@ void _sendMessage() async {
             ? _buildSearchField()
             : Row(
                 children: [
-                  if (widget.profilePic != null)
-                    CircleAvatar(
-                      backgroundImage: NetworkImage(widget.profilePic!),
-                    )
-                  else
-                    const CircleAvatar(child: Icon(Icons.person)),
+                  CircleAvatar(
+                    backgroundImage: (widget.profilePic != null && widget.profilePic!.isNotEmpty)
+                        ? (kIsWeb || widget.profilePic!.startsWith('http')
+                            ? NetworkImage(widget.profilePic!)
+                            : FileImage(File(widget.profilePic!)) as ImageProvider)
+                        : null,
+                    child: (widget.profilePic == null || widget.profilePic!.isEmpty)
+                        ? const Icon(Icons.person)
+                        : null,
+                  ),
                   const SizedBox(width: 10),
-                  Text(widget.contactName),
+                  Flexible(
+                    child: Text(
+                      widget.contactName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
                 ],
               ),
         actions: [
           if (!searchMode)
             IconButton(
               icon: const Icon(Icons.search),
-              onPressed: () {
-                setState(() {
-                  searchMode = true;
-                });
-              },
+              onPressed: () => setState(() => searchMode = true),
             ),
           IconButton(
             icon: const Icon(Icons.call),
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Llamada iniciada')),
-              );
-            },
+            onPressed: () => ScaffoldMessenger.of(context)
+                .showSnackBar(const SnackBar(content: Text('Llamada iniciada'))),
           ),
           IconButton(
             icon: const Icon(Icons.videocam),
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Videollamada iniciada')),
-              );
-            },
+            onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Videollamada iniciada'))),
           ),
         ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(4),
-          child: Container(
+        bottom: const PreferredSize(
+          preferredSize: Size.fromHeight(4),
+          child: SizedBox(
             height: 4,
-            decoration: const BoxDecoration(
-              gradient: LinearGradient(
-                colors: [Colors.pink, Colors.orange, Colors.yellow],
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(colors: [Colors.pink, Colors.orange, Colors.yellow]),
               ),
             ),
           ),
@@ -627,23 +983,10 @@ void _sendMessage() async {
       ),
       body: Stack(
         children: [
-          // Fondo de chat (imagen seleccionada) o color gris.
-          if (chatBackgroundPath != null)
-            Container(
-              decoration: BoxDecoration(
-                image: DecorationImage(
-                  image: FileImage(File(chatBackgroundPath!)),
-                  fit: BoxFit.cover,
-                ),
-              ),
-            )
-          else
-            Container(
-              color: Colors.grey[200],
-            ),
+          _buildBackground(),
           Column(
             children: [
-              // Barra superior adicional con idioma y configuración.
+              // Barra superior extra
               Padding(
                 padding: const EdgeInsets.all(8.0),
                 child: Row(
@@ -651,16 +994,11 @@ void _sendMessage() async {
                     const Spacer(),
                     DropdownButton<String>(
                       value: selectedLanguage,
-                      items: <Map<String, String>>[
-                        {'lang': 'en', 'label': 'Inglés'},
-                        {'lang': 'es', 'label': 'Español'},
-                        {'lang': 'fr', 'label': 'Francés'},
-                      ].map((Map<String, String> item) {
-                        return DropdownMenuItem<String>(
-                          value: item['lang'],
-                          child: Text(item['label']!),
-                        );
-                      }).toList(),
+                      items: const [
+                        DropdownMenuItem(value: 'en', child: Text('Inglés')),
+                        DropdownMenuItem(value: 'es', child: Text('Español')),
+                        DropdownMenuItem(value: 'fr', child: Text('Francés')),
+                      ],
                       onChanged: (val) {
                         setState(() {
                           selectedLanguage = val!;
@@ -670,26 +1008,20 @@ void _sendMessage() async {
                     ),
                     IconButton(
                       icon: const Icon(Icons.settings),
-                      onPressed: () {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Accediendo a configuración')),
-                        );
-                        _changeChatBackground();
-                      },
+                      onPressed: () => _changeChatBackground(),
                     ),
                   ],
                 ),
               ),
-              // Lista de mensajes.
+              // Lista de mensajes
               Expanded(
                 child: ListView.builder(
+                  controller: _listCtrl,
                   itemCount: filteredMessages.length,
-                  itemBuilder: (context, index) {
-                    return _buildMessageItem(index);
-                  },
+                  itemBuilder: (context, index) => _buildMessageItem(index),
                 ),
               ),
-              // Barra inferior con campo de texto y botones.
+              // Input
               Padding(
                 padding: const EdgeInsets.all(8.0),
                 child: Row(
@@ -708,20 +1040,16 @@ void _sendMessage() async {
                                 children: [
                                   GestureDetector(
                                     onTap: () => Navigator.pop(context, 'Foto'),
-                                    child: Column(
-                                      children: const [
-                                        Icon(Icons.photo_camera, size: 30),
-                                        Text('Foto'),
-                                      ],
+                                    child: const Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [Icon(Icons.photo_camera, size: 30), Text('Foto')],
                                     ),
                                   ),
                                   GestureDetector(
                                     onTap: () => Navigator.pop(context, 'Video'),
-                                    child: Column(
-                                      children: const [
-                                        Icon(Icons.videocam, size: 30),
-                                        Text('Video'),
-                                      ],
+                                    child: const Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [Icon(Icons.videocam, size: 30), Text('Video')],
                                     ),
                                   ),
                                 ],
@@ -729,9 +1057,7 @@ void _sendMessage() async {
                             );
                           },
                         );
-                        if (choice != null) {
-                          await _sendCameraMedia(choice);
-                        }
+                        if (choice != null) await _sendCameraMedia(choice);
                       },
                     ),
                     Expanded(
@@ -746,22 +1072,19 @@ void _sendMessage() async {
                       ),
                     ),
                     hasText
-                        ? IconButton(
-                            icon: const Icon(Icons.send),
-                            onPressed: _sendMessage,
-                          )
+                        ? IconButton(icon: const Icon(Icons.send), onPressed: _sendMessage)
                         : Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               IconButton(
-                                icon: const Icon(Icons.mic),
+                                icon: Icon(Icons.mic, color: _isRecording ? Colors.red : null),
                                 onPressed: _sendAudioMessage,
+                                tooltip: _isRecording ? 'Detener grabación' : 'Grabar audio',
                               ),
                               IconButton(
                                 icon: const Icon(Icons.attach_file),
                                 onPressed: () async {
-                                  final attachmentType =
-                                      await showModalBottomSheet<String>(
+                                  final attachmentType = await showModalBottomSheet<String>(
                                     context: context,
                                     builder: (context) {
                                       return Container(
@@ -771,33 +1094,24 @@ void _sendMessage() async {
                                           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                                           children: [
                                             GestureDetector(
-                                              onTap: () {
-                                                Navigator.pop(context, 'Foto');
-                                              },
-                                              child: Column(
-                                                children: const [
-                                                  Icon(Icons.photo, size: 30),
-                                                  Text('Foto'),
-                                                ],
+                                              onTap: () => Navigator.pop(context, 'Foto'),
+                                              child: const Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [Icon(Icons.photo, size: 30), Text('Foto')],
                                               ),
                                             ),
                                             GestureDetector(
-                                              onTap: () {
-                                                Navigator.pop(context, 'Video');
-                                              },
-                                              child: Column(
-                                                children: const [
-                                                  Icon(Icons.videocam, size: 30),
-                                                  Text('Video'),
-                                                ],
+                                              onTap: () => Navigator.pop(context, 'Video'),
+                                              child: const Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [Icon(Icons.videocam, size: 30), Text('Video')],
                                               ),
                                             ),
                                             GestureDetector(
-                                              onTap: () {
-                                                Navigator.pop(context, 'Documento');
-                                              },
-                                              child: Column(
-                                                children: const [
+                                              onTap: () => Navigator.pop(context, 'Documento'),
+                                              child: const Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
                                                   Icon(Icons.insert_drive_file, size: 30),
                                                   Text('Doc'),
                                                 ],

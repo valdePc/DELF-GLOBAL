@@ -6,6 +6,22 @@ import 'registro_screen.dart';
 import 'principal.dart';
 import 'dart:ui';
 
+
+
+
+/// Cambia estos colores a tu gusto y todo el chat se adapta.
+class ChatTheme {
+  static const primary = Color(0xFF0066FF);
+  static const bg = Color(0xFFF3F5F8);
+  static const bubbleMe = Color(0xFFDCEBFF);
+  static const bubbleOther = Colors.white;
+  static const bubbleShadow = Color(0x1A000000);
+}
+
+/// Enlace público para invitar (tu GitHub Pages actual del web build).
+/// Si cambias hosting, solo cambia aquí.
+const APP_INVITE_URL = 'https://valdepc.github.io/DELF-GLOBAL/';
+
 void main() {
   runApp(MyApp());
 }
