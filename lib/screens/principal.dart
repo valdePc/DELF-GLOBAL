@@ -4,10 +4,14 @@
 //    - Al agregar contacto: se normaliza y sube arriba.
 //    - Al abrir/crear chat o invitar: se “bumpea” (lastTouchedAt = now) y sube arriba.
 // 3) Sin romper funcionalidades existentes.
+// 4) SWIPE CONTACTOS: Derecha = Eliminar (confirma). Izquierda = Archivar / Bloquear (persistente).
+// 5) UI polish: contactos premium, anillos de estados con degradé, FAB extendido onScroll,
+//    bottom bar con frosted glass, snackbars con icono, confirmaciones en bottom sheet.
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui'; // para ImageFilter (blur)
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -17,6 +21,7 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_slidable/flutter_slidable.dart';
 
 import 'add_contact.dart';
 import 'chat_screen.dart';
@@ -61,6 +66,10 @@ class Contact {
   final int? createdAt;     // millisSinceEpoch
   final int? lastTouchedAt; // millisSinceEpoch
 
+  /// Flags persistentes
+  final bool isArchived;
+  final bool isBlocked;
+
   Contact({
     required this.id,
     required this.name,
@@ -69,6 +78,8 @@ class Contact {
     this.avatarUrl = '',
     this.createdAt,
     this.lastTouchedAt,
+    this.isArchived = false,
+    this.isBlocked = false,
   });
 
   factory Contact.fromMap(Map<String, dynamic> map) => Contact(
@@ -80,6 +91,8 @@ class Contact {
         createdAt: map['createdAt'] is int ? (map['createdAt'] as int) : null,
         lastTouchedAt:
             map['lastTouchedAt'] is int ? (map['lastTouchedAt'] as int) : null,
+        isArchived: map['isArchived'] == true,
+        isBlocked: map['isBlocked'] == true,
       );
 
   Map<String, dynamic> toMap() => {
@@ -90,6 +103,8 @@ class Contact {
         'avatarUrl': avatarUrl,
         if (createdAt != null) 'createdAt': createdAt,
         if (lastTouchedAt != null) 'lastTouchedAt': lastTouchedAt,
+        'isArchived': isArchived,
+        'isBlocked': isBlocked,
       };
 
   Contact copyWith({
@@ -100,6 +115,8 @@ class Contact {
     String? avatarUrl,
     int? createdAt,
     int? lastTouchedAt,
+    bool? isArchived,
+    bool? isBlocked,
   }) {
     return Contact(
       id: id ?? this.id,
@@ -109,6 +126,8 @@ class Contact {
       avatarUrl: avatarUrl ?? this.avatarUrl,
       createdAt: createdAt ?? this.createdAt,
       lastTouchedAt: lastTouchedAt ?? this.lastTouchedAt,
+      isArchived: isArchived ?? this.isArchived,
+      isBlocked: isBlocked ?? this.isBlocked,
     );
   }
 }
@@ -132,16 +151,30 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
 
   int _selectedIndex = 2;
 
+  // --- UI state
+  final ScrollController _scroll = ScrollController();
+  bool _fabExtended = true;
+
   @override
   void initState() {
     super.initState();
     _loadData();
     _subscribeMyChats();
+    _scroll.addListener(_onScroll);
+  }
+
+  void _onScroll() {
+    final showExtended = _scroll.positions.isNotEmpty && _scroll.offset <= 8;
+    if (showExtended != _fabExtended) {
+      setState(() => _fabExtended = showExtended);
+    }
   }
 
   @override
   void dispose() {
     _chatsSub?.cancel();
+    _scroll.removeListener(_onScroll);
+    _scroll.dispose();
     super.dispose();
   }
 
@@ -170,14 +203,182 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
     if (mounted) setState(() {});
   }
 
+  // Helpers Archivar/Bloquear/Eliminar (persistencia + UX)
+  Future<void> _archiveContact(Contact c) async {
+    HapticFeedback.lightImpact();
+    final idx = contacts.indexWhere((x) => x.id == c.id);
+    if (idx == -1) return;
+    contacts[idx] = contacts[idx].copyWith(isArchived: true);
+    await _saveContacts();
+    if (!mounted) return;
+    setState(() {});
+    _snackWithIcon('Contacto archivado: ${c.name}', Icons.archive_outlined,
+        action: SnackBarAction(
+          label: 'Deshacer',
+          onPressed: () async {
+            final i2 = contacts.indexWhere((x) => x.id == c.id);
+            if (i2 != -1) {
+              contacts[i2] = contacts[i2].copyWith(isArchived: false);
+              await _saveContacts();
+              if (mounted) setState(() {});
+            }
+          },
+        ));
+  }
+
+  Future<void> _blockContact(Contact c) async {
+    final confirmed = await _confirmSheet(
+      title: 'Bloquear contacto',
+      message:
+          'No podrás enviar ni recibir mensajes de ${c.name} hasta que lo desbloquees.',
+      confirmText: 'Bloquear',
+      confirmColor: Colors.black87,
+      icon: Icons.block,
+    );
+    if (confirmed != true) return;
+
+    HapticFeedback.lightImpact();
+    final idx = contacts.indexWhere((x) => x.id == c.id);
+    if (idx == -1) return;
+    contacts[idx] = contacts[idx].copyWith(isBlocked: true);
+    await _saveContacts();
+    if (!mounted) return;
+    setState(() {});
+    _snackWithIcon('Contacto bloqueado: ${c.name}', Icons.block,
+        action: SnackBarAction(
+          label: 'Desbloquear',
+          onPressed: () async {
+            final i2 = contacts.indexWhere((x) => x.id == c.id);
+            if (i2 != -1) {
+              contacts[i2] = contacts[i2].copyWith(isBlocked: false);
+              await _saveContacts();
+              if (mounted) setState(() {});
+            }
+          },
+        ));
+  }
+
+  Future<void> _deleteContact(Contact c) async {
+    final confirmed = await _confirmSheet(
+      title: 'Eliminar contacto',
+      message: 'Se eliminará “${c.name}” de tu lista de contactos.',
+      confirmText: 'Eliminar',
+      confirmColor: Colors.red,
+      icon: Icons.delete_outline,
+    );
+    if (confirmed != true) return;
+
+    HapticFeedback.lightImpact();
+    // Guardamos copia para UNDO
+    final backup = c;
+    contacts.removeWhere((x) => x.id == c.id);
+    await _saveContacts();
+    if (!mounted) return;
+    setState(() {});
+
+    _snackWithIcon('Contacto eliminado: ${c.name}', Icons.delete_outline,
+        action: SnackBarAction(
+          label: 'Deshacer',
+          onPressed: () async {
+            contacts.add(backup);
+            _sortContacts();
+            await _saveContacts();
+            if (mounted) setState(() {});
+          },
+        ));
+  }
+
+  void _snackWithIcon(String text, IconData icon, {SnackBarAction? action}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Row(
+          children: [
+            Icon(icon, size: 18, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(child: Text(text)),
+          ],
+        ),
+        action: action,
+      ),
+    );
+  }
+
+  Future<bool?> _confirmSheet({
+    required String title,
+    required String message,
+    required String confirmText,
+    required Color confirmColor,
+    required IconData icon,
+  }) {
+    return showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: false,
+      useSafeArea: true,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      showDragHandle: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 28),
+            const SizedBox(height: 8),
+            Text(title,
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            Text(message, textAlign: TextAlign.center),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Cancelar'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: confirmColor,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    onPressed: () => Navigator.pop(context, true),
+                    child: Text(confirmText),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   // ===================== INVITAR / ABRIR CHAT =====================
   Future<void> _openChatOrInvite(Contact c) async {
+    // Bloqueo coherente: no permitir abrir chat si está bloqueado
+    if (c.isBlocked) {
+      if (!mounted) return;
+      _snackWithIcon('Has bloqueado a ${c.name}. Desbloquéalo para chatear.',
+          Icons.block);
+      return;
+    }
+
     final myUid = FirebaseAuth.instance.currentUser?.uid;
     if (myUid == null) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Debes iniciar sesión')),
-      );
+      _snackWithIcon('Debes iniciar sesión', Icons.info_outline);
       return;
     }
 
@@ -190,11 +391,9 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
 
     if (phone == null && email == null) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text(
-                'Este contacto no tiene teléfono ni email. Edita el contacto para agregar uno.')),
-      );
+      _snackWithIcon(
+          'Este contacto no tiene teléfono ni email. Edita el contacto para agregar uno.',
+          Icons.edit_outlined);
       return;
     }
 
@@ -220,9 +419,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
       // 4) Evitar chat conmigo mismo
       if (otherUid == myUid) {
         if (!context.mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No puedes chatear contigo mismo.')),
-        );
+        _snackWithIcon('No puedes chatear contigo mismo.', Icons.person_outline);
         return;
       }
 
@@ -247,9 +444,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
     } catch (e, st) {
       final msg = describeError(e, st);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('No se pudo abrir el chat: $msg')),
-      );
+      _snackWithIcon('No se pudo abrir el chat: $msg', Icons.error_outline);
     }
   }
 
@@ -274,8 +469,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
         await launchUrl(uri);
       } else {
         if (!context.mounted) return;
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('No se pudo abrir SMS')));
+        _snackWithIcon('No se pudo abrir SMS', Icons.sms_failed_outlined);
       }
     }
 
@@ -289,8 +483,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
         await launchUrl(uri);
       } else {
         if (!context.mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('No se pudo abrir Email')));
+        _snackWithIcon('No se pudo abrir Email', Icons.email_outlined);
       }
     }
 
@@ -298,6 +491,8 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
     await showDialog<void>(
       context: context,
       builder: (_) => AlertDialog(
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: const Text('No está en la app'),
         content: Text(
             'Para poder chatear, $nombre debe registrarse. ¿Copiar enlace de invitación?'),
@@ -311,8 +506,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
               await Clipboard.setData(ClipboardData(text: inviteLink));
               if (!context.mounted) return;
               Navigator.pop(context);
-              ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Enlace copiado')));
+              _snackWithIcon('Enlace copiado', Icons.link_outlined);
             },
             child: const Text('Copiar enlace'),
           ),
@@ -325,6 +519,9 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
     showModalBottomSheet(
       context: context,
       showDragHandle: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
       builder: (_) => SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(16),
@@ -366,8 +563,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
                   await Clipboard.setData(ClipboardData(text: inviteLink));
                   if (!context.mounted) return;
                   Navigator.pop(context);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Enlace copiado')));
+                  _snackWithIcon('Enlace copiado', Icons.link_outlined);
                 },
               ),
             ],
@@ -469,9 +665,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
       // ignore: avoid_print
       print('chats stream error: $msg\n$st');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error cargando chats: $msg')),
-        );
+        _snackWithIcon('Error cargando chats: $msg', Icons.error_outline);
       }
     });
   }
@@ -506,39 +700,28 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
 
     return Column(
       children: [
-        // Carrusel de estados
-        Container(
-          height: 110,
-          padding: const EdgeInsets.symmetric(vertical: 10),
+        // Carrusel de estados (con anillo degradé)
+         Container(
+         height: 124, // o 122 si quieres más justo
+         padding: const EdgeInsets.symmetric(vertical: 8),
           child: ListView.builder(
             scrollDirection: Axis.horizontal,
             itemCount: statusIds.length + 1,
             itemBuilder: (context, idx) {
               if (idx == 0) {
                 return Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
                   child: GestureDetector(
                     onTap: _addNewStatus,
-                    child: const Column(
+                    child: Column(
                       children: [
-                        Stack(children: [
-                          CircleAvatar(
-                            radius: 35,
-                            backgroundColor: Colors.grey,
-                            child: Icon(Icons.add_a_photo, color: Colors.white),
-                          ),
-                          Positioned(
-                            right: 0,
-                            bottom: 0,
-                            child: CircleAvatar(
-                              radius: 12,
-                              backgroundColor: Colors.blueAccent,
-                              child: Icon(Icons.add, size: 16, color: Colors.white),
-                            ),
-                          )
-                        ]),
-                        SizedBox(height: 6),
-                        Text('Mi estado', style: TextStyle(fontSize: 12)),
+                        _statusAvatar(
+                          imageUrl: null,
+                          hasUnviewed: true,
+                          isSelf: true,
+                        ),
+                        const SizedBox(height: 6),
+                        const Text('Mi estado', style: TextStyle(fontSize: 12)),
                       ],
                     ),
                   ),
@@ -557,7 +740,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
                   matches.isNotEmpty ? matches.first.name : 'Contacto';
 
               return Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
                 child: GestureDetector(
                   onTap: () async {
                     final updated = await Navigator.push(
@@ -574,35 +757,21 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
                   },
                   child: Column(
                     children: [
-                      Container(
-                        width: 70,
-                        height: 70,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                              color:
-                                  hasUnviewed ? Colors.pinkAccent : Colors.grey,
-                              width: 3),
-                        ),
-                        child: ClipOval(
-                          child: displayStatus['imageUrl'] != null
-                              ? (displayStatus['imageUrl']
-                                              .toString()
-                                              .startsWith('http') ||
-                                      kIsWeb
-                                  ? Image.network(displayStatus['imageUrl'],
-                                      fit: BoxFit.cover)
-                                  : Image.file(
-                                      File(displayStatus['imageUrl']),
-                                      fit: BoxFit.cover))
-                              : const Icon(Icons.person,
-                                  size: 40, color: Colors.grey),
-                        ),
+                      _statusAvatar(
+                        imageUrl: displayStatus['imageUrl'],
+                        hasUnviewed: hasUnviewed,
                       ),
                       const SizedBox(height: 6),
-                      Text(contactName,
+                      SizedBox(
+                        width: 78,
+                        child: Text(
+                          contactName,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 12)),
+                          maxLines: 1,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -615,10 +784,11 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
         // Lista combinada: CHATS (si hay) + CONTACTOS (siempre)
         Expanded(
           child: ListView(
+            controller: _scroll,
             children: [
               if (chats.isNotEmpty) ...[
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
                   child: Text('Chats',
                       style: Theme.of(context).textTheme.titleMedium),
                 ),
@@ -626,9 +796,10 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
                 ),
+                _sectionDivider(),
               ],
               Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
                 child: Text('Contactos',
                     style: Theme.of(context).textTheme.titleMedium),
               ),
@@ -650,107 +821,102 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
           final chat = chats[i];
           return Dismissible(
             key: Key(chat['chatId']?.toString() ?? i.toString()),
-            background: Container(
+            background: _swipeBg(
+              alignLeft: true,
               color: Colors.red,
-              alignment: Alignment.centerLeft,
-              padding: const EdgeInsets.symmetric(horizontal: 20),
-              child: const Icon(Icons.delete, color: Colors.white),
+              icon: Icons.delete,
+              label: 'Eliminar',
             ),
-            secondaryBackground: Container(
-              color: Colors.blue,
-              alignment: Alignment.centerRight,
-              padding: const EdgeInsets.symmetric(horizontal: 20),
-              child: const Icon(Icons.archive, color: Colors.white),
+            secondaryBackground: _swipeBg(
+              alignLeft: false,
+              color: Colors.blueGrey.shade700,
+              icon: Icons.archive,
+              label: 'Archivar',
             ),
             confirmDismiss: (direction) async {
               // Aquí podrías implementar borrar/archivar en Firestore si quieres
+              _snackWithIcon('Acción no implementada en servidor',
+                  Icons.info_outline);
               return false; // por ahora, no borramos del servidor
             },
-            child: ListTile(
-              leading: (chat['profilePic'] != null &&
-                      (chat['profilePic'] as String).isNotEmpty)
-                  ? CircleAvatar(
-                      backgroundImage: NetworkImage(chat['profilePic']),
-                    )
-                  : const CircleAvatar(child: Icon(Icons.person)),
-              title: Text(chat['contactName'] ?? 'Chat'),
-              subtitle: Text(
-                (((chat['lastMessage'] as String?)?.trim() ?? '').isNotEmpty)
-                    ? (chat['lastMessage'] as String)
-                    : ((chat['handle'] as String?) ?? ''),
-              ),
-              trailing: chat['unreadCount'] != null && chat['unreadCount'] > 0
-                  ? Container(
-                      margin: const EdgeInsets.only(top: 4),
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: Colors.redAccent,
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        '${chat['unreadCount']}',
-                        style:
-                            const TextStyle(color: Colors.white, fontSize: 11),
-                      ),
-                    )
-                  : null,
-              onTap: () {
-                if (chat['chatId'] != null) {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => ChatScreen(
-                        contactName: chat['contactName'] ?? 'Chat',
-                        phone: chat['email'] ?? chat['phone'] ?? '',
-                        profilePic: chat['profilePic'],
-                        chatId: chat['chatId'],
-                      ),
-                    ),
-                  );
-                }
-              },
-            ),
+            child: _chatTile(chat),
           );
         },
       );
 
+  // --- CONTACTOS con Slidable premium
   Widget _buildContactsListView() {
-    if (contacts.isEmpty) {
+    // Ocultar archivados/bloqueados del listado principal (más fiel a WhatsApp).
+    final visibleContacts = contacts
+        .where((c) => !c.isArchived && !c.isBlocked)
+        .toList(growable: false);
+
+    if (visibleContacts.isEmpty) {
       return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        child: Text(
-          'No tienes contactos aún. Toca “+” para agregar uno.',
-          style: Theme.of(context).textTheme.bodyMedium,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 28),
+        child: Column(
+          children: [
+            const Icon(Icons.contact_page_outlined, size: 56, color: Colors.grey),
+            const SizedBox(height: 10),
+            Text(
+              'No tienes contactos aún. Toca “+” para agregar uno.',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ],
         ),
       );
     }
 
-    return ListView.builder(
+    return ListView.separated(
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
-      itemCount: contacts.length,
+      itemCount: visibleContacts.length,
+      separatorBuilder: (_, __) => _itemDivider(),
       itemBuilder: (context, i) {
-        final c = contacts[i];
-        return ListTile(
-          leading: c.avatarUrl.isNotEmpty
-              ? (kIsWeb
-                  ? Image.network(c.avatarUrl)
-                  : Image.file(File(c.avatarUrl)))
-              : const CircleAvatar(child: Icon(Icons.person)),
-          title: Text(c.name),
-          subtitle: Text(c.phone ?? c.email ?? ''),
-          onTap: () async {
-            try {
-              await _openChatOrInvite(c);
-            } catch (e, st) {
-              final msg = describeError(e, st);
-              if (!mounted) return;
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text('Error al abrir el chat: $msg')),
-              );
-            }
-          },
+        final c = visibleContacts[i];
+        return Slidable(
+          key: ValueKey('contact_${c.id}'),
+          // Deslizar a la derecha → Eliminar (zafacón)
+          startActionPane: ActionPane(
+            motion: const DrawerMotion(),
+            extentRatio: 0.30,
+            children: [
+              SlidableAction(
+                onPressed: (_) => _deleteContact(c),
+                backgroundColor: Colors.red,
+                foregroundColor: Colors.white,
+                icon: Icons.delete,
+                label: 'Eliminar',
+                borderRadius: BorderRadius.circular(14),
+              ),
+            ],
+          ),
+          // Deslizar a la izquierda → Archivar / Bloquear
+          endActionPane: ActionPane(
+            motion: const DrawerMotion(),
+            extentRatio: 0.60,
+            children: [
+              SlidableAction(
+                onPressed: (_) => _archiveContact(c),
+                backgroundColor: Colors.blueGrey.shade700,
+                foregroundColor: Colors.white,
+                icon: Icons.archive,
+                label: 'Archivar',
+                borderRadius: BorderRadius.circular(14),
+              ),
+              const SizedBox(width: 6),
+              SlidableAction(
+                onPressed: (_) => _blockContact(c),
+                backgroundColor: Colors.black87,
+                foregroundColor: Colors.white,
+                icon: Icons.block,
+                label: 'Bloquear',
+                borderRadius: BorderRadius.circular(14),
+              ),
+            ],
+          ),
+          child: _contactTile(c),
         );
       },
     );
@@ -784,43 +950,341 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final showExtended = _fabExtended;
     return Scaffold(
       body: _buildChatListScreen(),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () async {
-          final added = await Navigator.push<bool>(
-            context,
-            MaterialPageRoute(builder: (_) => const AddContactScreen()),
-          );
-          if (added == true) {
-            await _loadData(); // normaliza/ordena y refleja arriba
-          }
-        },
-        child: const Icon(Icons.person_add),
+      floatingActionButton: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 220),
+        child: showExtended
+            ? FloatingActionButton.extended(
+                key: const ValueKey('fab_ext'),
+                onPressed: _onAddContactPressed,
+                icon: const Icon(Icons.person_add),
+                label: const Text('Nuevo contacto'),
+              )
+            : FloatingActionButton(
+                key: const ValueKey('fab_round'),
+                onPressed: _onAddContactPressed,
+                child: const Icon(Icons.person_add),
+              ),
       ),
-      bottomNavigationBar: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            colors: [Color(0xFF1B2735), Color(0xFF415A77)],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight),
+      bottomNavigationBar: ClipRect(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
+          child: Container(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Color(0xCC1B2735), Color(0xCC415A77)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight),
+            ),
+            child: BottomNavigationBar(
+              currentIndex: _selectedIndex,
+              onTap: _onItemTapped,
+              backgroundColor: Colors.transparent,
+              elevation: 0,
+              type: BottomNavigationBarType.fixed,
+              selectedItemColor: Colors.blueAccent,
+              unselectedItemColor: Colors.white70,
+              items: const [
+                BottomNavigationBarItem(
+                    icon: Icon(Icons.video_camera_front_outlined), label: 'Reels'),
+                BottomNavigationBarItem(icon: Icon(Icons.phone), label: 'Teléfono'),
+                BottomNavigationBarItem(icon: Icon(Icons.chat), label: 'Chat'),
+                BottomNavigationBarItem(icon: Icon(Icons.group), label: 'Grupos'),
+                BottomNavigationBarItem(
+                    icon: Icon(Icons.settings), label: 'Configuración'),
+              ],
+            ),
+          ),
         ),
-        child: BottomNavigationBar(
-          currentIndex: _selectedIndex,
-          onTap: _onItemTapped,
-          backgroundColor: Colors.transparent,
-          elevation: 0,
-          type: BottomNavigationBarType.fixed,
-          selectedItemColor: Colors.blueAccent,
-          unselectedItemColor: Colors.white70,
-          items: const [
-            BottomNavigationBarItem(
-                icon: Icon(Icons.video_camera_front_outlined), label: 'Reels'),
-            BottomNavigationBarItem(icon: Icon(Icons.phone), label: 'Teléfono'),
-            BottomNavigationBarItem(icon: Icon(Icons.chat), label: 'Chat'),
-            BottomNavigationBarItem(icon: Icon(Icons.group), label: 'Grupos'),
-            BottomNavigationBarItem(
-                icon: Icon(Icons.settings), label: 'Configuración'),
+      ),
+    );
+  }
+
+  Future<void> _onAddContactPressed() async {
+    final added = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(builder: (_) => const AddContactScreen()),
+    );
+    if (added == true) {
+      await _loadData(); // normaliza/ordena y refleja arriba
+    }
+  }
+
+  // ===================== WIDGETS UI “premium” =====================
+
+  Widget _statusAvatar({
+    required String? imageUrl,
+    required bool hasUnviewed,
+    bool isSelf = false,
+  }) {
+    final ringGradient = hasUnviewed
+        ? const LinearGradient(colors: [Color(0xFF00C6FF), Color(0xFF0072FF)])
+        : LinearGradient(colors: [
+            Theme.of(context).dividerColor,
+            Theme.of(context).dividerColor
+          ]);
+
+    final bg = Theme.of(context).scaffoldBackgroundColor;
+
+    return Container(
+      width: 78,
+      height: 78,
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: ringGradient,
+        boxShadow: [
+          if (hasUnviewed)
+            BoxShadow(
+              color: Colors.black.withOpacity(0.18),
+              blurRadius: 6,
+              offset: const Offset(0, 2),
+            ),
+        ],
+      ),
+      child: Container(
+        decoration:
+            BoxDecoration(color: bg, shape: BoxShape.circle),
+        padding: const EdgeInsets.all(2),
+        child: ClipOval(
+          child: imageUrl != null
+              ? (imageUrl.toString().startsWith('http') || kIsWeb
+                  ? Image.network(imageUrl, fit: BoxFit.cover)
+                  : Image.file(File(imageUrl), fit: BoxFit.cover))
+              : CircleAvatar(
+                  backgroundColor: Colors.grey.shade400,
+                  child: Icon(
+                    isSelf ? Icons.add_a_photo : Icons.person,
+                    color: Colors.white,
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+
+  Widget _itemDivider() => Padding(
+        padding: const EdgeInsets.only(left: 88.0),
+        child: Divider(
+          height: 0.6,
+          thickness: 0.6,
+          color: Theme.of(context).dividerColor.withOpacity(0.6),
+        ),
+      );
+
+  Widget _sectionDivider() => Divider(
+        height: 12,
+        thickness: 0.8,
+        color: Theme.of(context).dividerColor.withOpacity(0.4),
+      );
+
+  Widget _contactTile(Contact c) {
+    final hasPhoto = c.avatarUrl.isNotEmpty;
+    return InkWell(
+      onTap: () async {
+        try {
+          await _openChatOrInvite(c);
+        } catch (e, st) {
+          final msg = describeError(e, st);
+          if (!mounted) return;
+          _snackWithIcon('Error al abrir el chat: $msg', Icons.error_outline);
+        }
+      },
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+        child: Row(
+          children: [
+            _avatar(hasPhoto ? null : _initials(c.name), photoUrl: c.avatarUrl),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(c.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context)
+                          .textTheme
+                          .titleMedium
+                          ?.copyWith(fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 2),
+                  Text(
+                    c.phone ?? c.email ?? '',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context)
+                            .textTheme
+                            .bodySmall
+                            ?.color
+                            ?.withOpacity(0.75)),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              _formatWhen(c.lastTouchedAt ?? c.createdAt),
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: Theme.of(context)
+                      .textTheme
+                      .labelSmall
+                      ?.color
+                      ?.withOpacity(0.6)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _chatTile(Map<String, dynamic> chat) {
+    final profilePic = (chat['profilePic'] as String?) ?? '';
+    final name = chat['contactName'] ?? 'Chat';
+    final subtitle = (((chat['lastMessage'] as String?)?.trim() ?? '').isNotEmpty)
+        ? (chat['lastMessage'] as String)
+        : ((chat['handle'] as String?) ?? '');
+    final unread = chat['unreadCount'] ?? 0;
+
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          child: Row(
+            children: [
+            profilePic.isNotEmpty
+            ? CircleAvatar(radius: 24, backgroundImage: NetworkImage(profilePic))
+  : _avatar(_initials(name)),
+
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context)
+                              .textTheme
+                              .titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w600)),
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: Theme.of(context)
+                                .textTheme
+                                .bodySmall
+                                ?.color
+                                ?.withOpacity(0.75)),
+                      ),
+                    ]),
+              ),
+              if (unread > 0) ...[
+                const SizedBox(width: 12),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.redAccent,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text('$unread',
+                      style: const TextStyle(color: Colors.white, fontSize: 11)),
+                ),
+              ]
+            ],
+          ),
+        ),
+        _itemDivider(),
+      ],
+    );
+  }
+
+  Widget _avatar(String? initials, {String? photoUrl}) {
+    if ((photoUrl ?? '').isNotEmpty) {
+      return CircleAvatar(radius: 28, backgroundImage: NetworkImage(photoUrl!));
+    }
+    // Fallback con degradé + iniciales
+    return Container(
+      width: 56,
+      height: 56,
+      decoration: const BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: LinearGradient(
+          colors: [Color(0xFF00C6FF), Color(0xFF0072FF)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+      ),
+      child: Center(
+        child: Text(
+          (initials ?? '👤'),
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.w700,
+            fontSize: 18,
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _initials(String name) {
+    final parts = name.trim().split(RegExp(r'\s+'));
+    if (parts.isEmpty) return '??';
+    String first = parts.first.isNotEmpty ? parts.first[0] : '';
+    String last = parts.length > 1 && parts.last.isNotEmpty ? parts.last[0] : '';
+    return (first + last).toUpperCase();
+  }
+
+  String _formatWhen(int? millis) {
+    if (millis == null) return '';
+    final dt = DateTime.fromMillisecondsSinceEpoch(millis);
+    final now = DateTime.now();
+    final sameDay = dt.year == now.year && dt.month == now.month && dt.day == now.day;
+    if (sameDay) {
+      final hh = dt.hour.toString().padLeft(2, '0');
+      final mm = dt.minute.toString().padLeft(2, '0');
+      return '$hh:$mm';
+    }
+    return '${dt.day.toString().padLeft(2, '0')}/${dt.month.toString().padLeft(2, '0')}';
+  }
+
+  Widget _swipeBg({
+    required bool alignLeft,
+    required Color color,
+    required IconData icon,
+    required String label,
+  }) {
+    return Container(
+      color: color,
+      alignment: alignLeft ? Alignment.centerLeft : Alignment.centerRight,
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.15),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (alignLeft) ...[
+              Icon(icon, color: Colors.white),
+              const SizedBox(width: 8),
+              Text(label,
+                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+            ] else ...[
+              Text(label,
+                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+              const SizedBox(width: 8),
+              Icon(icon, color: Colors.white),
+            ],
           ],
         ),
       ),
