@@ -1,36 +1,37 @@
-// lib/screens/principal.dart — FIX
-// Objetivos:
-// 1) El chat aparece aunque el otro usuario no te haya agregado (al crear el 1a1 ya se lista).
-// 2) Al salir del chat, ves la lista actualizada (stream en tiempo real desde Firestore).
-// 3) Sincroniza la lista de chats con Firestore (no dependemos de SharedPreferences para los chats).
+// lib/screens/principal.dart — FIX estable
+// 1) Lista de chats en tiempo real desde Firestore.
+// 2) Al tocar un contacto: si no existe → invitar; si existe → crear/asegurar 1a1 y navegar.
+// 3) Subtítulo del chat: último mensaje o email/teléfono.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:async';
-import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
-import 'package:image_picker/image_picker.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter/services.dart';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import 'status_viewer.dart';
-import 'chat_screen.dart';
-import 'reels.dart';
-import 'telefono.dart';
-import 'grupos.dart';
-import 'configuracion_screen.dart';
 import 'add_contact.dart';
+import 'chat_screen.dart';
+import 'configuracion_screen.dart';
+import 'grupos.dart';
+import 'reels.dart';
+import 'status_viewer.dart';
+import 'telefono.dart';
 
-import 'package:delf_global/services/user_directory.dart';
 import 'package:delf_global/services/chat_service.dart';
+import 'package:delf_global/services/user_directory.dart';
 import 'package:delf_global/app_config.dart';
+import 'package:firebase_core/firebase_core.dart' show FirebaseException;
 
 String buildInviteUrl(String refUid) => '$APP_INVITE_URL?ref=$refUid';
 
-/// Modelo de contactos (libreta local)
+/// Modelo (libreta local)
 class Contact {
   final String id;
   final String name;
@@ -70,7 +71,7 @@ class PrincipalScreen extends StatefulWidget {
 }
 
 class _PrincipalScreenState extends State<PrincipalScreen> {
-  // Estados tipo Instagram (local persist)
+  // Estados (persistencia local)
   List<Map<String, dynamic>> statuses = [];
   // Libreta local de contactos
   List<Contact> contacts = [];
@@ -97,22 +98,38 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
 
   // ===================== INVITAR / ABRIR CHAT =====================
   Future<void> _openChatOrInvite(Contact c) async {
-    final phone = c.phone;
-    final email = c.email;
-
     final myUid = FirebaseAuth.instance.currentUser?.uid;
     if (myUid == null) {
-      if (!mounted) return;
+      if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Debes iniciar sesión')),
       );
       return;
     }
 
-    try {
-      // Resolver UID del otro usuario
-      final otherUid = await UserDirectory.resolveUidByHandle(phone: phone, email: email);
+    // 1) Validar que el contacto tenga un handle (tel/email)
+    final String? phone =
+        (c.phone?.trim().isNotEmpty == true) ? c.phone!.trim() : null;
+    final String? email = (c.email?.trim().isNotEmpty == true)
+        ? c.email!.trim().toLowerCase()
+        : null;
 
+    if (phone == null && email == null) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'Este contacto no tiene teléfono ni email. Edita el contacto para agregar uno.')),
+      );
+      return;
+    }
+
+    try {
+      // 2) Resolver UID del otro usuario (debe existir en users/)
+      String? otherUid =
+          await UserDirectory.resolveUidByHandle(phone: phone, email: email);
+
+      // 3) Si no existe -> invitar (sin crashear)
       if (otherUid == null) {
         final inviteLink = buildInviteUrl(myUid);
         await _showInviteDialog(
@@ -125,26 +142,43 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
         return;
       }
 
-      // Crear/abrir chat 1a1. IMPORTANTE: esto crea/asegura chats/{chatId} con participants
-      final chatId = await ChatService.getOrCreate1to1(otherUid);
+      // 4) Evitar chat conmigo mismo
+      if (otherUid == myUid) {
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No puedes chatear contigo mismo.')),
+        );
+        return;
+      }
 
-      if (!mounted) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => ChatScreen(
-            chatId: chatId,
-            contactName: c.name,
-            phone: phone ?? (email ?? ''),
-            profilePic: '',
-          ),
-        ),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e')),
-      );
+      // 5) Crear/abrir 1-a-1 y navegar
+// 5) Crear/abrir 1-a-1 y navegar
+final chatId = await ChatService.getOrCreate1to1(otherUid);
+if (!mounted) return;
+
+Navigator.push(
+  context,
+  MaterialPageRoute(
+    builder: (_) => ChatScreen(
+      chatId: chatId,
+      contactName: c.name, // nombre que tú guardaste del otro
+      phone: phone ?? (email ?? ''),
+      profilePic: '',
+    ),
+  ),
+);
+} catch (e, st) {
+  String msg;
+  if (e is FirebaseException) {
+    msg = '[${e.plugin}/${e.code}] ${e.message ?? 'Error de Firebase'}';
+  } else {
+    msg = e.toString();
+  }
+
+  if (!mounted) return;
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(content: Text('No se pudo abrir el chat: $msg')),
+  );
     }
   }
 
@@ -155,51 +189,66 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
     String? email,
     required String inviteLink,
   }) async {
-    final String mensaje = '¡Hola $nombre! Te invito a unirte a Delf para chatear conmigo. Regístrate aquí: $inviteLink';
+    final String mensaje =
+        '¡Hola $nombre! Te invito a unirte a Delf para chatear conmigo. '
+        'Regístrate aquí: $inviteLink';
 
     Future<void> _inviteViaSms(String? toPhone) async {
-      final uri = Uri(scheme: 'sms', path: (toPhone ?? '').trim(), queryParameters: {'body': mensaje});
+      final uri = Uri(
+        scheme: 'sms',
+        path: (toPhone ?? '').trim(),
+        queryParameters: {'body': mensaje},
+      );
       if (await canLaunchUrl(uri)) {
         await launchUrl(uri);
       } else {
-        if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se pudo abrir SMS')));
-        }
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('No se pudo abrir SMS')));
       }
     }
 
     Future<void> _inviteViaEmail(String? toEmail) async {
-      final uri = Uri(scheme: 'mailto', path: (toEmail ?? '').trim(), queryParameters: {'subject': 'Únete a Delf', 'body': mensaje});
+      final uri = Uri(
+        scheme: 'mailto',
+        path: (toEmail ?? '').trim(),
+        queryParameters: {'subject': 'Únete a Delf', 'body': mensaje},
+      );
       if (await canLaunchUrl(uri)) {
         await launchUrl(uri);
       } else {
-        if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se pudo abrir Email')));
-        }
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No se pudo abrir Email')));
       }
     }
 
     Future<void> _copyInviteLink() async {
       await Clipboard.setData(ClipboardData(text: inviteLink));
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enlace copiado')));
-      }
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Enlace copiado')));
     }
 
+    // Dialog rápido
     await showDialog<void>(
       context: context,
       builder: (_) => AlertDialog(
         title: const Text('No está en la app'),
-        content: Text('Para poder chatear, $nombre debe registrarse. ¿Copiar enlace de invitación?'),
+        content: Text(
+            'Para poder chatear, $nombre debe registrarse. ¿Copiar enlace de invitación?'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cerrar')),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cerrar'),
+          ),
           ElevatedButton(
             onPressed: () async {
               await Clipboard.setData(ClipboardData(text: inviteLink));
-              if (context.mounted) {
-                Navigator.pop(context);
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enlace copiado')));
-              }
+              if (!context.mounted) return;
+              Navigator.pop(context);
+              ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Enlace copiado')));
             },
             child: const Text('Copiar enlace'),
           ),
@@ -208,6 +257,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
     );
 
     if (!context.mounted) return;
+    // Opciones extendidas
     showModalBottomSheet(
       context: context,
       showDragHandle: true,
@@ -217,7 +267,11 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
           child: Wrap(
             runSpacing: 8,
             children: [
-              Center(child: Text('Invitar a $nombre', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600))),
+              Center(
+                child: Text('Invitar a $nombre',
+                    style: const TextStyle(
+                        fontSize: 18, fontWeight: FontWeight.w600)),
+              ),
               const Divider(),
               if ((phone ?? '').trim().isNotEmpty)
                 ListTile(
@@ -242,7 +296,8 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
               ListTile(
                 leading: const Icon(Icons.link),
                 title: const Text('Copiar enlace'),
-                subtitle: Text(inviteLink, maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: Text(inviteLink,
+                    maxLines: 1, overflow: TextOverflow.ellipsis),
                 onTap: () {
                   Navigator.pop(context);
                   _copyInviteLink();
@@ -260,10 +315,14 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
     final prefs = await SharedPreferences.getInstance();
 
     final statusesString = prefs.getString('statuses');
-    statuses = statusesString != null ? (json.decode(statusesString) as List).cast<Map<String, dynamic>>() : [];
+    statuses = statusesString != null
+        ? (json.decode(statusesString) as List).cast<Map<String, dynamic>>()
+        : [];
 
     final contactsString = prefs.getString('contacts');
-    final rawContacts = contactsString != null ? (json.decode(contactsString) as List).cast<Map<String, dynamic>>() : <Map<String, dynamic>>[];
+    final rawContacts = contactsString != null
+        ? (json.decode(contactsString) as List).cast<Map<String, dynamic>>()
+        : <Map<String, dynamic>>[];
     contacts = rawContacts.map((m) => Contact.fromMap(m)).toList();
 
     setState(() {});
@@ -285,44 +344,53 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
 
       for (final d in snapshot.docs) {
         final data = d.data();
-        final List<dynamic> parts = (data['participants'] as List<dynamic>? ?? const []);
+        final parts = List<String>.from(data['participants'] ?? const []);
         if (parts.length < 2) continue;
-        final String otherUid = (parts.firstWhere((x) => x != uid)) as String;
 
-        // cache de usuario
-        if (!_userCache.containsKey(otherUid)) {
+        final otherUid = parts.firstWhere((x) => x != uid, orElse: () => '');
+        if (otherUid.isEmpty) continue;
+
+        // Cache de usuario
+        _userCache[otherUid] ??= {};
+        if (_userCache[otherUid]!.isEmpty) {
           try {
             final u = await UserDirectory.getUserPublic(otherUid);
             _userCache[otherUid] = u ?? {};
-          } catch (_) {
-            _userCache[otherUid] = {};
-          }
+          } catch (_) {}
         }
         final u = _userCache[otherUid] ?? {};
 
-final displayName = (u['fullName'] as String?) 
-    ?? (data['nameMap']?[otherUid] as String?) 
-    ?? 'Contacto';
-final photoUrl = (u['photoUrl'] as String?) ?? '';
-final contactHandle = (u['email'] as String?) 
-    ?? (u['phoneE164'] as String?) 
-    ?? '';
+        final displayName = (u['fullName'] as String?) ??
+            (data['nameMap']?[otherUid] as String?) ??
+            'Contacto';
+        final photoUrl = (u['photoUrl'] as String?) ?? '';
+        final handle =
+            (u['email'] as String?) ?? (u['phoneE164'] as String?) ?? '';
 
-// Construir item para la lista
-next.add({
-  'chatId'      : data['id'] ?? d.id,
-  'contactName' : displayName,
-  'profilePic'  : photoUrl,
-  'handle'      : contactHandle,     // <- nuevo
-  'phone'       : u['phoneE164'],
-  'email'       : u['email'],
-  'lastMessage' : data['ultimoMensaje'] ?? '',
-  'unreadCount' : 0,
-});
-
+        next.add({
+          'chatId': data['id'] ?? d.id,
+          'contactName': displayName,
+          'profilePic': photoUrl,
+          'handle': handle, // para subtítulo si no hay último mensaje
+          'phone': u['phoneE164'],
+          'email': u['email'],
+          'lastMessage': data['ultimoMensaje'] ?? '',
+          'unreadCount': 0,
+        });
       }
 
       if (mounted) setState(() => chats = next);
+    }, onError: (e, st) {
+      final msg = (e is FirebaseException)
+          ? '[${e.plugin}/${e.code}] ${e.message}'
+          : e.toString();
+      // ignore: avoid_print
+      print('chats stream error: $msg\n$st');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error cargando chats: $msg')),
+        );
+      }
     });
   }
 
@@ -331,7 +399,12 @@ next.add({
     final picker = ImagePicker();
     final pickedFile = await picker.pickImage(source: ImageSource.gallery);
     if (pickedFile != null) {
-      final newStatus = {'contactId': 'me', 'contactName': 'Tú', 'imageUrl': pickedFile.path, 'viewed': false};
+      final newStatus = {
+        'contactId': 'me',
+        'contactName': 'Tú',
+        'imageUrl': pickedFile.path,
+        'viewed': false,
+      };
       statuses.insert(0, newStatus);
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('statuses', json.encode(statuses));
@@ -367,8 +440,20 @@ next.add({
                     child: const Column(
                       children: [
                         Stack(children: [
-                          CircleAvatar(radius: 35, backgroundColor: Colors.grey, child: Icon(Icons.add_a_photo, color: Colors.white)),
-                          Positioned(right: 0, bottom: 0, child: CircleAvatar(radius: 12, backgroundColor: Colors.blueAccent, child: Icon(Icons.add, size: 16, color: Colors.white)))
+                          CircleAvatar(
+                            radius: 35,
+                            backgroundColor: Colors.grey,
+                            child: Icon(Icons.add_a_photo, color: Colors.white),
+                          ),
+                          Positioned(
+                            right: 0,
+                            bottom: 0,
+                            child: CircleAvatar(
+                              radius: 12,
+                              backgroundColor: Colors.blueAccent,
+                              child: Icon(Icons.add, size: 16, color: Colors.white),
+                            ),
+                          )
                         ]),
                         SizedBox(height: 6),
                         Text('Mi estado', style: TextStyle(fontSize: 12)),
@@ -379,13 +464,15 @@ next.add({
               }
 
               final cid = statusIds[idx - 1];
-              final myStatuses = grouped[cid] ?? const <Map<String, dynamic>>[];
+              final myStatuses =
+                  grouped[cid] ?? const <Map<String, dynamic>>[];
               if (myStatuses.isEmpty) return const SizedBox.shrink();
               final hasUnviewed = myStatuses.any((s) => s['viewed'] == false);
               final displayStatus = myStatuses.first;
 
               final matches = contacts.where((c) => c.id == cid);
-              final contactName = matches.isNotEmpty ? matches.first.name : 'Contacto';
+              final contactName =
+                  matches.isNotEmpty ? matches.first.name : 'Contacto';
 
               return Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -410,18 +497,30 @@ next.add({
                         height: 70,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
-                          border: Border.all(color: hasUnviewed ? Colors.pinkAccent : Colors.grey, width: 3),
+                          border: Border.all(
+                              color:
+                                  hasUnviewed ? Colors.pinkAccent : Colors.grey,
+                              width: 3),
                         ),
                         child: ClipOval(
                           child: displayStatus['imageUrl'] != null
-                              ? (displayStatus['imageUrl'].toString().startsWith('http') || kIsWeb
-                                  ? Image.network(displayStatus['imageUrl'], fit: BoxFit.cover)
-                                  : Image.file(File(displayStatus['imageUrl']), fit: BoxFit.cover))
-                              : const Icon(Icons.person, size: 40, color: Colors.grey),
+                              ? (displayStatus['imageUrl']
+                                              .toString()
+                                              .startsWith('http') ||
+                                      kIsWeb
+                                  ? Image.network(displayStatus['imageUrl'],
+                                      fit: BoxFit.cover)
+                                  : Image.file(
+                                      File(displayStatus['imageUrl']),
+                                      fit: BoxFit.cover))
+                              : const Icon(Icons.person,
+                                  size: 40, color: Colors.grey),
                         ),
                       ),
                       const SizedBox(height: 6),
-                      Text(contactName, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+                      Text(contactName,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 12)),
                     ],
                   ),
                 ),
@@ -431,60 +530,87 @@ next.add({
         ),
         const Divider(height: 1),
 
-       // Lista combinada: CHATS (si hay) + CONTACTOS (siempre)
-Expanded(
-  child: ListView(
-    children: [
-      if (chats.isNotEmpty) ...[
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-          child: Text('Chats', style: Theme.of(context).textTheme.titleMedium),
+        // Lista combinada: CHATS (si hay) + CONTACTOS (siempre)
+        Expanded(
+          child: ListView(
+            children: [
+              if (chats.isNotEmpty) ...[
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                  child: Text('Chats',
+                      style: Theme.of(context).textTheme.titleMedium),
+                ),
+                _buildChatsListView(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                ),
+              ],
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                child: Text('Contactos',
+                    style: Theme.of(context).textTheme.titleMedium),
+              ),
+              _buildContactsListView(),
+            ],
+          ),
         ),
-        _buildChatsListView(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-        ),
-      ],
-      Padding(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-        child: Text('Contactos', style: Theme.of(context).textTheme.titleMedium),
-      ),
-      _buildContactsListView(),
-    ],
-  ),
-),
-
       ],
     );
   }
 
-Widget _buildChatsListView({bool shrinkWrap = false, ScrollPhysics? physics}) =>
-    ListView.builder(
-      shrinkWrap: shrinkWrap,
-      physics: physics,
+  Widget _buildChatsListView(
+          {bool shrinkWrap = false, ScrollPhysics? physics}) =>
+      ListView.builder(
+        shrinkWrap: shrinkWrap,
+        physics: physics,
         itemCount: chats.length,
         itemBuilder: (context, i) {
           final chat = chats[i];
           return Dismissible(
             key: Key(chat['chatId']?.toString() ?? i.toString()),
-            background: Container(color: Colors.red, alignment: Alignment.centerLeft, padding: const EdgeInsets.symmetric(horizontal: 20), child: const Icon(Icons.delete, color: Colors.white)),
-            secondaryBackground: Container(color: Colors.blue, alignment: Alignment.centerRight, padding: const EdgeInsets.symmetric(horizontal: 20), child: const Icon(Icons.archive, color: Colors.white)),
+            background: Container(
+              color: Colors.red,
+              alignment: Alignment.centerLeft,
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: const Icon(Icons.delete, color: Colors.white),
+            ),
+            secondaryBackground: Container(
+              color: Colors.blue,
+              alignment: Alignment.centerRight,
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: const Icon(Icons.archive, color: Colors.white),
+            ),
             confirmDismiss: (direction) async {
               // Aquí podrías implementar borrar/archivar en Firestore si quieres
               return false; // por ahora, no borramos del servidor
             },
             child: ListTile(
-              leading: (chat['profilePic'] != null && (chat['profilePic'] as String).isNotEmpty)
-                  ? CircleAvatar(backgroundImage: NetworkImage(chat['profilePic']))
+              leading: (chat['profilePic'] != null &&
+                      (chat['profilePic'] as String).isNotEmpty)
+                  ? CircleAvatar(
+                      backgroundImage: NetworkImage(chat['profilePic']),
+                    )
                   : const CircleAvatar(child: Icon(Icons.person)),
               title: Text(chat['contactName'] ?? 'Chat'),
-              subtitle: Text(chat['lastMessage'] ?? ''),
+              subtitle: Text(
+                (((chat['lastMessage'] as String?)?.trim() ?? '').isNotEmpty)
+                    ? (chat['lastMessage'] as String)
+                    : ((chat['handle'] as String?) ?? ''),
+              ),
               trailing: chat['unreadCount'] != null && chat['unreadCount'] > 0
                   ? Container(
                       margin: const EdgeInsets.only(top: 4),
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(color: Colors.redAccent, borderRadius: BorderRadius.circular(12)),
-                      child: Text('${chat['unreadCount']}', style: const TextStyle(color: Colors.white, fontSize: 11)),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: Colors.redAccent,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Text(
+                        '${chat['unreadCount']}',
+                        style:
+                            const TextStyle(color: Colors.white, fontSize: 11),
+                      ),
                     )
                   : null,
               onTap: () {
@@ -517,6 +643,7 @@ Widget _buildContactsListView() {
       ),
     );
   }
+
   return ListView.builder(
     shrinkWrap: true,
     physics: const NeverScrollableScrollPhysics(),
@@ -525,11 +652,23 @@ Widget _buildContactsListView() {
       final c = contacts[i];
       return ListTile(
         leading: c.avatarUrl.isNotEmpty
-            ? (kIsWeb ? Image.network(c.avatarUrl) : Image.file(File(c.avatarUrl)))
+            ? (kIsWeb
+                ? Image.network(c.avatarUrl)
+                : Image.file(File(c.avatarUrl)))
             : const CircleAvatar(child: Icon(Icons.person)),
         title: Text(c.name),
         subtitle: Text(c.phone ?? c.email ?? ''),
-        onTap: () => _openChatOrInvite(c),
+        onTap: () async {
+          try {
+            await _openChatOrInvite(c);
+          } catch (e, st) {
+            final msg = e.toString();
+            if (!mounted) return; // <-- clave para el warning
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Error al abrir el chat: $msg')),
+            );
+          }
+        },
       );
     },
   );
@@ -555,7 +694,10 @@ Widget _buildContactsListView() {
       default:
         targetScreen = const PrincipalScreen();
     }
-    Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => targetScreen));
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(builder: (_) => targetScreen),
+    );
   }
 
   @override
@@ -564,18 +706,23 @@ Widget _buildContactsListView() {
       body: _buildChatListScreen(),
       floatingActionButton: FloatingActionButton(
         onPressed: () async {
-          final added = await Navigator.push<bool>(context, MaterialPageRoute(builder: (_) => const AddContactScreen()));
+          final added = await Navigator.push<bool>(
+            context,
+            MaterialPageRoute(builder: (_) => const AddContactScreen()),
+          );
           if (added == true) {
-            // Si se agregó contacto, recarga libreta.
-            _loadData();
-            // La lista de chats se actualiza sola por stream si se creó un 1a1.
+            _loadData(); // La lista de chats se actualiza sola por stream
           }
         },
         child: const Icon(Icons.person_add),
       ),
       bottomNavigationBar: Container(
         decoration: const BoxDecoration(
-          gradient: LinearGradient(colors: [Color(0xFF1B2735), Color(0xFF415A77)], begin: Alignment.topLeft, end: Alignment.bottomRight),
+          gradient: LinearGradient(
+            colors: [Color(0xFF1B2735), Color(0xFF415A77)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
         ),
         child: BottomNavigationBar(
           currentIndex: _selectedIndex,
@@ -586,11 +733,13 @@ Widget _buildContactsListView() {
           selectedItemColor: Colors.blueAccent,
           unselectedItemColor: Colors.white70,
           items: const [
-            BottomNavigationBarItem(icon: Icon(Icons.video_camera_front_outlined), label: 'Reels'),
+            BottomNavigationBarItem(
+                icon: Icon(Icons.video_camera_front_outlined), label: 'Reels'),
             BottomNavigationBarItem(icon: Icon(Icons.phone), label: 'Teléfono'),
             BottomNavigationBarItem(icon: Icon(Icons.chat), label: 'Chat'),
             BottomNavigationBarItem(icon: Icon(Icons.group), label: 'Grupos'),
-            BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Configuración'),
+            BottomNavigationBarItem(
+                icon: Icon(Icons.settings), label: 'Configuración'),
           ],
         ),
       ),
