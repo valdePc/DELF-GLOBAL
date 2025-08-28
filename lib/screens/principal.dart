@@ -1,7 +1,9 @@
-// lib/screens/principal.dart — FIX estable
-// 1) Lista de chats en tiempo real desde Firestore.
-// 2) Al tocar un contacto: si no existe → invitar; si existe → crear/asegurar 1a1 y navegar.
-// 3) Subtítulo del chat: último mensaje o email/teléfono.
+// lib/screens/principal.dart — FIX estable (orden correcto: último primero)
+// 1) CHATS: ya vienen por Firestore ordenados por updatedAt DESC.
+// 2) CONTACTOS: se guardan con createdAt/lastTouchedAt y se ordenan por lastTouchedAt DESC.
+//    - Al agregar contacto: se normaliza y sube arriba.
+//    - Al abrir/crear chat o invitar: se “bumpea” (lastTouchedAt = now) y sube arriba.
+// 3) Sin romper funcionalidades existentes.
 
 import 'dart:async';
 import 'dart:convert';
@@ -31,6 +33,22 @@ import 'package:firebase_core/firebase_core.dart' show FirebaseException;
 
 String buildInviteUrl(String refUid) => '$APP_INVITE_URL?ref=$refUid';
 
+/// --- Helper para mostrar el error REAL (evita "Dart exception thrown from converted Future")
+String describeError(Object e, StackTrace st) {
+  if (e is AsyncError) {
+    final inner = e.error;
+    final s = e.stackTrace ?? st;
+    if (inner is FirebaseException) {
+      return '[${inner.plugin}/${inner.code}] ${inner.message ?? 'Firebase error'}';
+    }
+    return '$inner\n$s';
+  }
+  if (e is FirebaseException) {
+    return '[${e.plugin}/${e.code}] ${e.message ?? 'Firebase error'}';
+  }
+  return '$e';
+}
+
 /// Modelo (libreta local)
 class Contact {
   final String id;
@@ -39,12 +57,18 @@ class Contact {
   final String? email;
   final String avatarUrl;
 
+  /// Timestamps para ordenar
+  final int? createdAt;     // millisSinceEpoch
+  final int? lastTouchedAt; // millisSinceEpoch
+
   Contact({
     required this.id,
     required this.name,
     this.phone,
     this.email,
     this.avatarUrl = '',
+    this.createdAt,
+    this.lastTouchedAt,
   });
 
   factory Contact.fromMap(Map<String, dynamic> map) => Contact(
@@ -53,6 +77,9 @@ class Contact {
         phone: map['phone'] as String?,
         email: map['email'] as String?,
         avatarUrl: map['avatarUrl'] as String? ?? '',
+        createdAt: map['createdAt'] is int ? (map['createdAt'] as int) : null,
+        lastTouchedAt:
+            map['lastTouchedAt'] is int ? (map['lastTouchedAt'] as int) : null,
       );
 
   Map<String, dynamic> toMap() => {
@@ -61,7 +88,29 @@ class Contact {
         'phone': phone,
         'email': email,
         'avatarUrl': avatarUrl,
+        if (createdAt != null) 'createdAt': createdAt,
+        if (lastTouchedAt != null) 'lastTouchedAt': lastTouchedAt,
       };
+
+  Contact copyWith({
+    String? id,
+    String? name,
+    String? phone,
+    String? email,
+    String? avatarUrl,
+    int? createdAt,
+    int? lastTouchedAt,
+  }) {
+    return Contact(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      phone: phone ?? this.phone,
+      email: email ?? this.email,
+      avatarUrl: avatarUrl ?? this.avatarUrl,
+      createdAt: createdAt ?? this.createdAt,
+      lastTouchedAt: lastTouchedAt ?? this.lastTouchedAt,
+    );
+  }
 }
 
 class PrincipalScreen extends StatefulWidget {
@@ -94,6 +143,31 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
   void dispose() {
     _chatsSub?.cancel();
     super.dispose();
+  }
+
+  // ===================== PERSISTENCIA CONTACTOS =====================
+  Future<void> _saveContacts() async {
+    final prefs = await SharedPreferences.getInstance();
+    final list = contacts.map((c) => c.toMap()).toList();
+    await prefs.setString('contacts', json.encode(list));
+  }
+
+  void _sortContacts() {
+    contacts.sort((a, b) {
+      int aval = (a.lastTouchedAt ?? a.createdAt ?? 0);
+      int bval = (b.lastTouchedAt ?? b.createdAt ?? 0);
+      return bval.compareTo(aval); // DESC → último primero
+    });
+  }
+
+  Future<void> _touchContact(String contactId) async {
+    final idx = contacts.indexWhere((c) => c.id == contactId);
+    if (idx == -1) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    contacts[idx] = contacts[idx].copyWith(lastTouchedAt: now);
+    _sortContacts();
+    await _saveContacts();
+    if (mounted) setState(() {});
   }
 
   // ===================== INVITAR / ABRIR CHAT =====================
@@ -129,7 +203,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
       String? otherUid =
           await UserDirectory.resolveUidByHandle(phone: phone, email: email);
 
-      // 3) Si no existe -> invitar (sin crashear)
+      // 3) Si no existe -> invitar (sin crashear). Igual lo “bumpeamos”.
       if (otherUid == null) {
         final inviteLink = buildInviteUrl(myUid);
         await _showInviteDialog(
@@ -139,6 +213,7 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
           email: email,
           inviteLink: inviteLink,
         );
+        await _touchContact(c.id); // mover arriba por última interacción
         return;
       }
 
@@ -152,33 +227,29 @@ class _PrincipalScreenState extends State<PrincipalScreen> {
       }
 
       // 5) Crear/abrir 1-a-1 y navegar
-// 5) Crear/abrir 1-a-1 y navegar
-final chatId = await ChatService.getOrCreate1to1(otherUid);
-if (!mounted) return;
+      final chatId = await ChatService.getOrCreate1to1(otherUid);
+      if (!mounted) return;
 
-Navigator.push(
-  context,
-  MaterialPageRoute(
-    builder: (_) => ChatScreen(
-      chatId: chatId,
-      contactName: c.name, // nombre que tú guardaste del otro
-      phone: phone ?? (email ?? ''),
-      profilePic: '',
-    ),
-  ),
-);
-} catch (e, st) {
-  String msg;
-  if (e is FirebaseException) {
-    msg = '[${e.plugin}/${e.code}] ${e.message ?? 'Error de Firebase'}';
-  } else {
-    msg = e.toString();
-  }
+      // Bumpeamos contacto por interacción
+      await _touchContact(c.id);
 
-  if (!mounted) return;
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(content: Text('No se pudo abrir el chat: $msg')),
-  );
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ChatScreen(
+            chatId: chatId,
+            contactName: c.name, // nombre que tú guardaste del otro
+            phone: phone ?? (email ?? ''),
+            profilePic: '',
+          ),
+        ),
+      );
+    } catch (e, st) {
+      final msg = describeError(e, st);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('No se pudo abrir el chat: $msg')),
+      );
     }
   }
 
@@ -221,13 +292,6 @@ Navigator.push(
         ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('No se pudo abrir Email')));
       }
-    }
-
-    Future<void> _copyInviteLink() async {
-      await Clipboard.setData(ClipboardData(text: inviteLink));
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Enlace copiado')));
     }
 
     // Dialog rápido
@@ -298,9 +362,12 @@ Navigator.push(
                 title: const Text('Copiar enlace'),
                 subtitle: Text(inviteLink,
                     maxLines: 1, overflow: TextOverflow.ellipsis),
-                onTap: () {
+                onTap: () async {
+                  await Clipboard.setData(ClipboardData(text: inviteLink));
+                  if (!context.mounted) return;
                   Navigator.pop(context);
-                  _copyInviteLink();
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Enlace copiado')));
                 },
               ),
             ],
@@ -310,7 +377,7 @@ Navigator.push(
     );
   }
 
-  // ===================== CARGA LOCAL (estados/agenda) =====================
+  // ===================== CARGA LOCAL (estados/agenda/contacts) =====================
   Future<void> _loadData() async {
     final prefs = await SharedPreferences.getInstance();
 
@@ -325,7 +392,22 @@ Navigator.push(
         : <Map<String, dynamic>>[];
     contacts = rawContacts.map((m) => Contact.fromMap(m)).toList();
 
-    setState(() {});
+    // Normalizar timestamps y ordenar
+    final now = DateTime.now().millisecondsSinceEpoch;
+    bool changed = false;
+    contacts = contacts.map((c) {
+      int? created = c.createdAt ?? now;
+      int? touched = c.lastTouchedAt ?? created;
+      if (c.createdAt == null || c.lastTouchedAt == null) changed = true;
+      return c.copyWith(createdAt: created, lastTouchedAt: touched);
+    }).toList();
+
+    _sortContacts();
+    if (changed) {
+      await _saveContacts();
+    }
+
+    if (mounted) setState(() {});
   }
 
   // ===================== STREAM DE CHATS (Tiempo real) =====================
@@ -633,46 +715,46 @@ Navigator.push(
         },
       );
 
-Widget _buildContactsListView() {
-  if (contacts.isEmpty) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      child: Text(
-        'No tienes contactos aún. Toca “+” para agregar uno.',
-        style: Theme.of(context).textTheme.bodyMedium,
-      ),
+  Widget _buildContactsListView() {
+    if (contacts.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Text(
+          'No tienes contactos aún. Toca “+” para agregar uno.',
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
+      );
+    }
+
+    return ListView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: contacts.length,
+      itemBuilder: (context, i) {
+        final c = contacts[i];
+        return ListTile(
+          leading: c.avatarUrl.isNotEmpty
+              ? (kIsWeb
+                  ? Image.network(c.avatarUrl)
+                  : Image.file(File(c.avatarUrl)))
+              : const CircleAvatar(child: Icon(Icons.person)),
+          title: Text(c.name),
+          subtitle: Text(c.phone ?? c.email ?? ''),
+          onTap: () async {
+            try {
+              await _openChatOrInvite(c);
+            } catch (e, st) {
+              final msg = describeError(e, st);
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Error al abrir el chat: $msg')),
+              );
+            }
+          },
+        );
+      },
     );
   }
-
-  return ListView.builder(
-    shrinkWrap: true,
-    physics: const NeverScrollableScrollPhysics(),
-    itemCount: contacts.length,
-    itemBuilder: (context, i) {
-      final c = contacts[i];
-      return ListTile(
-        leading: c.avatarUrl.isNotEmpty
-            ? (kIsWeb
-                ? Image.network(c.avatarUrl)
-                : Image.file(File(c.avatarUrl)))
-            : const CircleAvatar(child: Icon(Icons.person)),
-        title: Text(c.name),
-        subtitle: Text(c.phone ?? c.email ?? ''),
-        onTap: () async {
-          try {
-            await _openChatOrInvite(c);
-          } catch (e, st) {
-            final msg = e.toString();
-            if (!mounted) return; // <-- clave para el warning
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Error al abrir el chat: $msg')),
-            );
-          }
-        },
-      );
-    },
-  );
-}
 
   // ===================== NAV =====================
   void _onItemTapped(int index) {
@@ -711,7 +793,7 @@ Widget _buildContactsListView() {
             MaterialPageRoute(builder: (_) => const AddContactScreen()),
           );
           if (added == true) {
-            _loadData(); // La lista de chats se actualiza sola por stream
+            await _loadData(); // normaliza/ordena y refleja arriba
           }
         },
         child: const Icon(Icons.person_add),
@@ -721,8 +803,7 @@ Widget _buildContactsListView() {
           gradient: LinearGradient(
             colors: [Color(0xFF1B2735), Color(0xFF415A77)],
             begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
+            end: Alignment.bottomRight),
         ),
         child: BottomNavigationBar(
           currentIndex: _selectedIndex,
