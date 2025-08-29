@@ -389,11 +389,11 @@ Future<void> _initializeVideo(int index) async {
           );
         },
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _uploadNewReel,
-        backgroundColor: Colors.pinkAccent,
-        child: Icon(Icons.add),
-      ),
+     // floatingActionButton: FloatingActionButton(
+      //  onPressed: _uploadNewReel,
+       // backgroundColor: Colors.pinkAccent,
+       // child: Icon(Icons.add),
+    //  ),
       // Barra de navegación inferior
       bottomNavigationBar: Container(
         decoration: BoxDecoration(

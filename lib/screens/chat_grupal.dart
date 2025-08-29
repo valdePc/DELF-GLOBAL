@@ -3,10 +3,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
-//import 'grupos.dart';
+
 /// Modelo de mensaje para chat grupal.
-/// - [senderName]: nombre del remitente.
-/// - [isSent]: indica si el mensaje es del usuario actual.
 class Message {
   final String id;
   final String senderName;
@@ -82,7 +80,6 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
   @override
   void initState() {
     super.initState();
-    // Inicializamos una lista simulada con mensajes de distintos usuarios.
     messages = [
       Message(
         id: '1',
@@ -351,12 +348,10 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
     }
   }
 
-  /// Determina si dos fechas corresponden al mismo día.
   bool isSameDate(DateTime d1, DateTime d2) {
     return d1.year == d2.year && d1.month == d2.month && d1.day == d2.day;
   }
 
-  /// Filtra los mensajes según el término de búsqueda.
   List<Message> get filteredMessages {
     if (filterQuery.isNotEmpty) {
       return messages
@@ -366,11 +361,9 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
     return messages;
   }
 
-  /// Construye cada ítem (burbuja) del mensaje en el chat grupal.
   Widget _buildMessageItem(int index) {
     final msg = filteredMessages[index];
 
-    // Mostrar separador de fecha si es el primer mensaje o si cambia el día.
     bool showDateHeader = false;
     if (index == 0) {
       showDateHeader = true;
@@ -381,9 +374,6 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
       }
     }
 
-    // En chat grupal, se muestra el nombre del remitente si:
-    // - El mensaje no es del usuario actual, y
-    // - Es el primer mensaje o el remitente es distinto al del mensaje anterior.
     bool showSenderName = false;
     if (!msg.isSent) {
       if (index == 0) {
@@ -436,7 +426,6 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
                   padding: const EdgeInsets.only(right: 8.0),
                   child: CircleAvatar(
                     radius: 14,
-                    // En un caso real usarías la foto del usuario; aquí usamos un asset de ejemplo.
                     backgroundImage: const AssetImage('assets/profile_small.png'),
                   ),
                 ),
@@ -466,7 +455,9 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
                           child: Text(
                             msg.translatedText!,
                             style: const TextStyle(
-                                fontSize: 12, fontStyle: FontStyle.italic),
+                              fontSize: 12,
+                              fontStyle: FontStyle.italic,
+                            ),
                           ),
                         ),
                     ],
@@ -497,7 +488,6 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
     );
   }
 
-  /// Único widget para construir el campo de búsqueda.
   Widget _buildSearchField() {
     return TextField(
       controller: _searchController,
@@ -581,7 +571,6 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
       ),
       body: Stack(
         children: [
-          // Fondo del chat: imagen seleccionada o color de fondo.
           if (chatBackgroundPath != null)
             Container(
               decoration: BoxDecoration(
@@ -592,12 +581,10 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
               ),
             )
           else
-            Container(
-              color: Colors.grey[200],
-            ),
+            Container(color: Colors.grey[200]),
           Column(
             children: [
-              // Barra superior adicional para idioma y fondo.
+              // Barra superior adicional para idioma y menú
               Padding(
                 padding: const EdgeInsets.all(8.0),
                 child: Row(
@@ -622,19 +609,20 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
                         });
                       },
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.settings),
-                      onPressed: () {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Accediendo a configuración')),
-                        );
-                        _changeChatBackground();
+                    PopupMenuButton<String>(
+                      icon: const Icon(Icons.more_vert),
+                      onSelected: (v) {
+                        if (v == 'bg') _changeChatBackground();
                       },
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(value: 'bg', child: Text('Cambiar fondo')),
+                      ],
                     ),
                   ],
                 ),
               ),
-              // Lista de mensajes.
+
+              // Lista de mensajes
               Expanded(
                 child: ListView.builder(
                   itemCount: filteredMessages.length,
@@ -643,7 +631,8 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
                   },
                 ),
               ),
-              // Barra inferior: campo de texto y botones.
+
+              // Barra inferior: campo de texto y botones
               Padding(
                 padding: const EdgeInsets.all(8.0),
                 child: Row(
@@ -658,12 +647,13 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
                               padding: const EdgeInsets.all(16),
                               height: 100,
                               child: Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceEvenly,
                                 children: [
                                   GestureDetector(
                                     onTap: () => Navigator.pop(context, 'Foto'),
-                                    child: Column(
-                                      children: const [
+                                    child: const Column(
+                                      children: [
                                         Icon(Icons.photo_camera, size: 30),
                                         Text('Foto'),
                                       ],
@@ -671,8 +661,8 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
                                   ),
                                   GestureDetector(
                                     onTap: () => Navigator.pop(context, 'Video'),
-                                    child: Column(
-                                      children: const [
+                                    child: const Column(
+                                      children: [
                                         Icon(Icons.videocam, size: 30),
                                         Text('Video'),
                                       ],
@@ -722,14 +712,15 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
                                         padding: const EdgeInsets.all(16),
                                         height: 100,
                                         child: Row(
-                                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.spaceEvenly,
                                           children: [
                                             GestureDetector(
                                               onTap: () {
                                                 Navigator.pop(context, 'Foto');
                                               },
-                                              child: Column(
-                                                children: const [
+                                              child: const Column(
+                                                children: [
                                                   Icon(Icons.photo, size: 30),
                                                   Text('Foto'),
                                                 ],
@@ -739,8 +730,8 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
                                               onTap: () {
                                                 Navigator.pop(context, 'Video');
                                               },
-                                              child: Column(
-                                                children: const [
+                                              child: const Column(
+                                                children: [
                                                   Icon(Icons.videocam, size: 30),
                                                   Text('Video'),
                                                 ],
@@ -750,8 +741,8 @@ class _ChatGrupalScreenState extends State<ChatGrupalScreen> {
                                               onTap: () {
                                                 Navigator.pop(context, 'Documento');
                                               },
-                                              child: Column(
-                                                children: const [
+                                              child: const Column(
+                                                children: [
                                                   Icon(Icons.insert_drive_file, size: 30),
                                                   Text('Doc'),
                                                 ],

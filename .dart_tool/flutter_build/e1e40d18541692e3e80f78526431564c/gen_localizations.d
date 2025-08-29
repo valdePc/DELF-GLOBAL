@@ -1,1 +1,0 @@
- C:\\DELF\ GLOBAL\\delf_global\\.dart_tool\\flutter_gen\\gen_l10n\\app_localizations_es.dart C:\\DELF\ GLOBAL\\delf_global\\.dart_tool\\flutter_gen\\gen_l10n\\app_localizations.dart:  C:\\DELF\ GLOBAL\\delf_global\\l10n.yaml C:\\DELF\ GLOBAL\\delf_global\\lib/l10n\\app_es.arb
